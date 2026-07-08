@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roleplay-backend"
+version = "0.1.0"
+description = "Roleplay AI Chat Backend"
+requires-python = ">=3.14"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shared*", "fastapi_server*", "actor_agent*", "chronicler_agent*", "director_agent*"]
