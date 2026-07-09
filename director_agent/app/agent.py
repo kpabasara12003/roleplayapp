@@ -1,5 +1,6 @@
 import json
 import re
+import asyncio
 from typing import Optional
 
 from nats.aio.client import Client as NATS
@@ -51,10 +52,16 @@ class DirectorAgent:
 
     async def connect(self):
         self.nc = NATS()
-        opts: dict = {"servers": settings.nats_url}
+        opts: dict = {
+            "servers": [settings.nats_url],
+            "connect_timeout": 10.0,
+            "max_reconnect_attempts": 5,
+            "reconnect_time_wait": 2.0,
+        }
         if settings.nats_user and settings.nats_password:
             opts["user"] = settings.nats_user
             opts["password"] = settings.nats_password
+            
         await self.nc.connect(**opts)
         self.js = self.nc.jetstream()
 
@@ -118,11 +125,20 @@ class DirectorAgent:
                 logger.error("Director error: %s", e)
                 await msg.nak()
 
-        async for msg in sub:
-            await process(msg)
+        while True:
+            try:
+                msg = await sub.next_msg(timeout=2.0)
+                await process(msg)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error("Director loop error: %s", e)
+                await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
-    import asyncio
     agent = DirectorAgent()
-    asyncio.run(agent.run())
+    try:
+        asyncio.run(agent.run())
+    except KeyboardInterrupt:
+        logger.info("Director Agent shutting down cleanly...")
