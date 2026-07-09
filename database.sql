@@ -64,7 +64,7 @@ CREATE TABLE conversations (
     ai_character_id INTEGER REFERENCES characters(id),
     user_character_id INTEGER REFERENCES characters(id),
     current_place TEXT DEFAULT 'Unknown',
-    current_time TEXT DEFAULT 'Unknown',
+    "current_time" TEXT DEFAULT 'Unknown',
     status VARCHAR(20) DEFAULT 'active',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
