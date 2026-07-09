@@ -1,5 +1,6 @@
 import json
 import httpx
+import asyncio
 from typing import Optional, List, Any
 
 from nats.aio.client import Client as NATS
@@ -97,10 +98,16 @@ class ActorAgent:
 
     async def connect(self):
         self.nc = NATS()
-        opts: Any = {"servers": settings.nats_url}
+        opts: Any = {
+            "servers": [settings.nats_url],
+            "connect_timeout": 10.0,
+            "max_reconnect_attempts": 5,
+            "reconnect_time_wait": 2.0,
+        }
         if settings.nats_user and settings.nats_password:
             opts["user"] = settings.nats_user
             opts["password"] = settings.nats_password
+            
         await self.nc.connect(**opts)
         self.js = self.nc.jetstream()
 
@@ -121,12 +128,9 @@ class ActorAgent:
         conversation_id = data["conversation_id"]
 
         conv = await fetch_one(
-            """
-            SELECT c.id, c.scenario_id, c.ai_character_id, c.user_character_id,
+            """SELECT c.id, c.scenario_id, c.ai_character_id, c.user_character_id,
                    c.current_place, c.current_time, s.title, s.introduction
-            FROM conversations c
-            JOIN scenarios s ON c.scenario_id = s.id
-            WHERE c.id = %s
+            FROM conversations c JOIN scenarios s ON c.scenario_id = s.id WHERE c.id = %s
             """,
             (conversation_id,),
         )
@@ -146,11 +150,9 @@ class ActorAgent:
             )
 
         recent_messages = await fetch_all(
-            """
-            SELECT sender, content FROM messages
+            """SELECT sender, content FROM messages
             WHERE conversation_id = %s
-            ORDER BY created_at DESC
-            LIMIT 20
+            ORDER BY created_at DESC LIMIT 20
             """,
             (conversation_id,),
         )
@@ -198,7 +200,6 @@ class ActorAgent:
         )
         logger.info("Actor responded for conv=%s msg=%s", conversation_id, ai_msg["id"])
 
-        # Publish ai_response event for Director agent (reuse same connection)
         try:
             await self.js.publish(
                 "roleplay.chat.ai_response",
@@ -227,11 +228,20 @@ class ActorAgent:
                 logger.error("Error processing message: %s", e)
                 await msg.nak()
 
-        async for msg in sub:
-            await process(msg)
+        while True:
+            try:
+                msg = await sub.next_msg(timeout=2.0)
+                await process(msg)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error("Actor loop error: %s", e)
+                await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
-    import asyncio
     agent = ActorAgent()
-    asyncio.run(agent.run())
+    try:
+        asyncio.run(agent.run())
+    except KeyboardInterrupt:
+        logger.info("Actor Agent shutting down cleanly...")

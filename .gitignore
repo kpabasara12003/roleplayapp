@@ -16,7 +16,7 @@ nats_client.py
 qdrant.py
 .cache
 .pytest_cache/
-
+requirementsgo.txt
 
 .vscode/
 .idea/
