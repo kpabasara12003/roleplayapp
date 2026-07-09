@@ -11,13 +11,12 @@ env/
 .venv/
 
 qdrant.py
-postgres.py
-nats_client.py
-qdrant.py
+
+
 .cache
 .pytest_cache/
 requirementsgo.txt
-
+frontend/
 .vscode/
 .idea/
 
