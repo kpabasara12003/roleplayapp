@@ -1,6 +1,7 @@
 import os
 import asyncio
-from typing import List, Optional, Any
+import warnings
+from typing import List, Optional
 
 import httpx
 from qdrant_client import AsyncQdrantClient
@@ -14,6 +15,9 @@ from qdrant_client.models import (
 )
 from flashrank import Ranker, RerankRequest
 from shared.utils.logger import get_logger
+
+# Suppress the UserWarning regarding unencrypted HTTP connections with an API key
+warnings.filterwarnings("ignore", category=UserWarning, module="qdrant_client")
 
 logger = get_logger(__name__)
 
@@ -34,7 +38,7 @@ _ranker: Optional[Ranker] = None
 
 
 def get_qdrant_client() -> AsyncQdrantClient:
-    """Lazy-initialize the fully asynchronous Qdrant Client."""
+    """Lazy-initialize the asynchronous Qdrant Client."""
     global _client
     if _client is None:
         kwargs: dict = {"url": QDRANT_URL}
@@ -49,7 +53,6 @@ def get_flashrank_client() -> Ranker:
     """Lazy-initialize the lightweight flashrank cross-encoder model."""
     global _ranker
     if _ranker is None:
-        # Default model: ms-marco-MiniLM-L-6-v2 (extremely fast and accurate)
         _ranker = Ranker(cache_dir=os.path.join(os.getcwd(), ".cache", "flashrank"))
         logger.info("FlashRank Cross-Encoder Ranker initialized successfully.")
     return _ranker
@@ -72,10 +75,7 @@ async def _ensure_collection_exists(collection_name: str):
 
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    Call DO BGE-M3 inference endpoint to generate vector embeddings.
-    Includes an asynchronous exponential backoff routine to cleanly recover from 429 Rate Limits.
-    """
+    """Call DO BGE-M3 inference endpoint with exponential backoff for 429 errors."""
     if not texts:
         return []
     
@@ -98,7 +98,7 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
                 
                 if resp.status_code == 429:
                     sleep_time = backoff_factor ** attempt
-                    logger.warning("BGE Embedding API returned 429. Backing off for %.1fs (Attempt %d/%d)", sleep_time, attempt + 1, max_retries)
+                    logger.warning("BGE Embedding API returned 429. Backing off for %.1fs", sleep_time)
                     await asyncio.sleep(sleep_time)
                     continue
                 
@@ -134,8 +134,6 @@ def _build_filter(filters: Optional[dict]) -> Optional[Filter]:
         return filters
 
     conditions = []
-    
-    # Handle targeted dictionary conditions
     for key, value in filters.items():
         if key == "must" and isinstance(value, list):
             for cond in value:
@@ -161,17 +159,19 @@ async def search_similar(
     limit: int = 5,
     filters: Optional[dict] = None,
 ) -> List[dict]:
-    """Execute vector similarity search over an index non-blockingly."""
+    """Execute vector similarity search using the modern query_points interface."""
     await _ensure_collection_exists(collection)
     client = get_qdrant_client()
     qf = _build_filter(filters)
     
     try:
-        results = await client.search(
+        # Migrated from client.search to modern client.query_points API
+        results = await client.query_points(
             collection_name=collection,
-            query_vector=vector,
+            query=vector,
             limit=limit,
-            query_filter=qf
+            query_filter=qf,
+            with_payload=True
         )
         return [
             {
@@ -179,7 +179,7 @@ async def search_similar(
                 "score": r.score,
                 "payload": r.payload or {},
             }
-            for r in results
+            for r in results.points
         ]
     except Exception as e:
         logger.error("Database query exception running similarity search on %s: %s", collection, e)
@@ -187,20 +187,14 @@ async def search_similar(
 
 
 def rerank_documents(query: str, documents: List[dict], top_n: int = 5) -> List[dict]:
-    """
-    Reranks vector search results using a local Cross-Encoder model.
-    Filters out semantic noise, keeping only highly relevant contextual matches.
-    """
+    """Reranks vector search results using a local Cross-Encoder model."""
     if not documents:
         return []
     
     try:
         ranker = get_flashrank_client()
-        
-        # Format the documents to match the input structure needed by FlashRank
         passages = []
         for idx, doc in enumerate(documents):
-            # Fallback chains to locate the textual content to parse
             text_content = (
                 doc.get("payload", {}).get("summary") or 
                 doc.get("payload", {}).get("content") or 
@@ -209,22 +203,19 @@ def rerank_documents(query: str, documents: List[dict], top_n: int = 5) -> List[
             passages.append({
                 "id": idx, 
                 "text": text_content,
-                "meta": doc # Preserve parent dict reference structure
+                "meta": doc 
             })
             
         rerank_request = RerankRequest(query=query, passages=passages)
         ranked_results = ranker.rerank(rerank_request)
         
-        # Reassemble the payload records sorted by the new Cross-Encoder score metric
         final_docs = []
         for record in ranked_results[:top_n]:
             original_doc = record["meta"]
             original_doc["rerank_score"] = float(record["score"])
             final_docs.append(original_doc)
             
-        logger.debug("Successfully reranked documents down to top_%d entries", len(final_docs))
         return final_docs
-        
     except Exception as e:
         logger.error("Reranking pipeline crashed, defaulting to base vector ordering: %s", e)
         return documents[:top_n]

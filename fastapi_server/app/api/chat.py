@@ -186,6 +186,19 @@ async def websocket_chat(websocket: WebSocket, conversation_id: int):
         return
 
     await websocket.accept()
+    
+    # Subscribe to NATS for live AI replies tailored to this conversation
+    sub = None
+    if nats_publisher.nc:
+        async def nats_handler(msg):
+            try:
+                data = json.loads(msg.data.decode())
+                await websocket.send_text(json.dumps(data))
+            except Exception as e:
+                logger.error("Error pushing NATS msg to websocket: %s", e)
+                
+        sub = await nats_publisher.nc.subscribe(f"roleplay.chat.reply.{conversation_id}", cb=nats_handler)
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -225,3 +238,9 @@ async def websocket_chat(websocket: WebSocket, conversation_id: int):
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for conv=%s", conversation_id)
+    finally:
+        if sub:
+            try:
+                await sub.unsubscribe()
+            except Exception:
+                pass

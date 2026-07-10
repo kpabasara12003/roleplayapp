@@ -134,16 +134,21 @@ class DirectorAgent:
             except Exception as e:
                 logger.error("Director loop error: %s", e)
                 await asyncio.sleep(1)
-
-
 if __name__ == "__main__":
     import sys
-    # FIXED: Force Windows to use SelectorEventLoop for psycopg compatibility
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    import selectors
 
-    agent = DirectorAgent()
+    agent = DirectorAgent()  
     try:
-        asyncio.run(agent.run())
+        if sys.platform == "win32":
+            # Modern, warning-free way to force SelectorEventLoop on Windows for psycopg compatibility
+            def win_loop_factory():
+                return asyncio.SelectorEventLoop(selectors.SelectSelector())
+                
+            asyncio.run(agent.run(), loop_factory=win_loop_factory)
+        else:
+            # Linux/macOS run natively without modifications
+            asyncio.run(agent.run())
+            
     except KeyboardInterrupt:
-        logger.info("Director Agent shutting down cleanly...")
+        logger.info("Agent shutting down cleanly via interface break request...")

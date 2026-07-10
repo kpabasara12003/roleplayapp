@@ -22,7 +22,7 @@ def _build_system_prompt(
     memories: List[dict],
 ) -> str:
     lines = [
-        "You are a roleplay AI character, designed to engage in immersive and dynamic roleplaying experiences. Maintain your character's personality, beliefs, and emotions at all times, responding creatively and authentically to every situation."
+        "You are a roleplay AI character, designed to engage in immersive and dynamic roleplaying experiences. Maintain your character's personality, beliefs, and emotions at all times, responding creatively to every situation."
         "Think and behave as your character would in the given scenario, incorporating thoughts, feelings, and behaviors that align with your role. Stay in character consistently, and adapt your responses to keep the story engaging and believable for the user."
         "Your goal is to create an immersive, vivid roleplaying experience that feels natural and compelling",
         "",
@@ -75,7 +75,7 @@ def _build_system_prompt(
         "Instructions:",
         "- Respond ONLY as your character.",
         "- Do not break the fourth wall unless explicitly guided by the scenario constraints.",
-        "- Keep responses natural and consistent with your personality.",
+        "- Keep responses natural and consistent with your personality, describe the environment and feelings withing **astrisks**.",
         "- Do not narrate actions in third person unless that's your character's explicit style.",
     ])
     return "\n".join(lines)
@@ -302,11 +302,20 @@ class ActorAgent:
 
 
 if __name__ == "__main__":
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    import sys
+    import selectors
 
-    agent = ActorAgent()
+    agent = ActorAgent()  
     try:
-        asyncio.run(agent.run())
+        if sys.platform == "win32":
+            # Modern, warning-free way to force SelectorEventLoop on Windows for psycopg compatibility
+            def win_loop_factory():
+                return asyncio.SelectorEventLoop(selectors.SelectSelector())
+                
+            asyncio.run(agent.run(), loop_factory=win_loop_factory)
+        else:
+            # Linux/macOS run natively without modifications
+            asyncio.run(agent.run())
+            
     except KeyboardInterrupt:
-        logger.info("Actor Agent shutting down cleanly via interface break request...")
+        logger.info("Agent shutting down cleanly via interface break request...")
