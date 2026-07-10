@@ -103,7 +103,7 @@ class DirectorAgent:
                 params.append(new_place)
                 logger.info("Director updated place for conv=%s -> %s", conversation_id, new_place)
             if new_time:
-                updates.append("current_time = %s")
+                updates.append('"current_time" = %s')
                 params.append(new_time)
                 logger.info("Director updated time for conv=%s -> %s", conversation_id, new_time)
 
@@ -134,11 +134,21 @@ class DirectorAgent:
             except Exception as e:
                 logger.error("Director loop error: %s", e)
                 await asyncio.sleep(1)
-
-
 if __name__ == "__main__":
-    agent = DirectorAgent()
+    import sys
+    import selectors
+
+    agent = DirectorAgent()  
     try:
-        asyncio.run(agent.run())
+        if sys.platform == "win32":
+            # Modern, warning-free way to force SelectorEventLoop on Windows for psycopg compatibility
+            def win_loop_factory():
+                return asyncio.SelectorEventLoop(selectors.SelectSelector())
+                
+            asyncio.run(agent.run(), loop_factory=win_loop_factory)
+        else:
+            # Linux/macOS run natively without modifications
+            asyncio.run(agent.run())
+            
     except KeyboardInterrupt:
-        logger.info("Director Agent shutting down cleanly...")
+        logger.info("Agent shutting down cleanly via interface break request...")

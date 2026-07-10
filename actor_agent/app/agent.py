@@ -1,11 +1,12 @@
 import json
 import httpx
 import asyncio
+import sys
 from typing import Optional, List, Any
 
 from nats.aio.client import Client as NATS
 from shared.db.postgres import fetch_one, fetch_all, execute_returning
-from shared.db.qdrant import embed_texts, search_similar
+from shared.db.qdrant import embed_texts, search_similar, rerank_documents
 from shared.utils.logger import get_logger
 from actor_agent.app.config import settings
 
@@ -21,7 +22,9 @@ def _build_system_prompt(
     memories: List[dict],
 ) -> str:
     lines = [
-        "You are a roleplay AI character. Stay in character at all times.",
+        "You are a roleplay AI character, designed to engage in immersive and dynamic roleplaying experiences. Maintain your character's personality, beliefs, and emotions at all times, responding creatively to every situation."
+        "Think and behave as your character would in the given scenario, incorporating thoughts, feelings, and behaviors that align with your role. Stay in character consistently, and adapt your responses to keep the story engaging and believable for the user."
+        "Your goal is to create an immersive, vivid roleplaying experience that feels natural and compelling",
         "",
         f"Scenario: {scenario.get('title', 'Untitled')}",
         f"Place: {current_place}",
@@ -53,42 +56,72 @@ def _build_system_prompt(
         if user_char.get("personality"):
             lines.append(f"Personality: {user_char['personality']}")
         if user_char.get("likes"):
-            lines.append(f"Likes: {', '.join(user_char['likes'])}")
+            # Clean handling for array fields vs string values
+            likes_data = user_char["likes"]
+            likes_str = ", ".join(likes_data) if isinstance(likes_data, list) else str(likes_data)
+            lines.append(f"Likes: {likes_str}")
         if user_char.get("role_description"):
             lines.append(f"Role: {user_char['role_description']}")
 
     if memories:
-        lines.extend(["", "=== Relevant Past Memories ==="])
-        for m in memories[:5]:
-            lines.append(f"- {m.get('payload', {}).get('summary', 'Memory')}")
+        lines.extend(["", "=== Highly Relevant Past Memories ==="])
+        for m in memories:
+            payload = m.get("payload", {})
+            summary = payload.get("summary") or payload.get("content") or "Past interaction recorded."
+            lines.append(f"- {summary}")
 
     lines.extend([
         "",
         "Instructions:",
         "- Respond ONLY as your character.",
-        "- Do not break the fourth wall unless the scenario demands it.",
-        "- Keep responses natural and consistent with your personality.",
-        "- Do not narrate actions in third person unless that's your character's style.",
+        "- Do not break the fourth wall unless explicitly guided by the scenario constraints.",
+        "- Keep responses natural and consistent with your personality, describe the environment and feelings withing **astrisks**.",
+        "- Do not narrate actions in third person unless that's your character's explicit style.",
     ])
     return "\n".join(lines)
 
 
 async def _call_llm(messages: List[dict]) -> str:
+    """
+    Executes conversational inference calls with integrated HTTP status verification
+    and automated backoff calculations when hit by remote 429 rate throttles.
+    """
     payload = {
         "model": settings.llm_model,
         "messages": messages,
         "max_tokens": settings.llm_max_tokens,
         "temperature": settings.llm_temperature,
     }
+    
+    max_retries = 4
+    backoff_factor = 2.0
+    
     async with httpx.AsyncClient(timeout=60.0) as client:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.llm_api_key}",
-        }
-        resp = await client.post(settings.llm_api_url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {settings.llm_api_key}",
+                }
+                resp = await client.post(settings.llm_api_url, headers=headers, json=payload)
+                
+                if resp.status_code == 429:
+                    sleep_time = backoff_factor ** attempt
+                    logger.warning("LLM Inference endpoint returned 429 Rate Limit. Retrying in %.1fs...", sleep_time)
+                    await asyncio.sleep(sleep_time)
+                    continue
+                    
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+                
+            except httpx.HTTPError as e:
+                if attempt == max_retries - 1:
+                    logger.error("LLM execution ultimately failed after maximum retry attempts: %s", e)
+                    raise e
+                await asyncio.sleep(backoff_factor ** attempt)
+                
+    raise RuntimeError("LLM request lifecycle ended without producing structural responses.")
 
 
 class ActorAgent:
@@ -97,12 +130,13 @@ class ActorAgent:
         self.js = None
 
     async def connect(self):
+        """Establish fault-tolerant streaming pipelines with NATS JetStream infrastructure."""
         self.nc = NATS()
-        opts: Any = {
+        opts: dict = {
             "servers": [settings.nats_url],
             "connect_timeout": 10.0,
-            "max_reconnect_attempts": 5,
-            "reconnect_time_wait": 2.0,
+            "max_reconnect_attempts": 10,
+            "reconnect_time_wait": 3.0,
         }
         if settings.nats_user and settings.nats_password:
             opts["user"] = settings.nats_user
@@ -111,6 +145,7 @@ class ActorAgent:
         await self.nc.connect(**opts)
         self.js = self.nc.jetstream()
 
+        # Enforce Stream Declarations safely
         for stream_name, subjects in [
             ("roleplay_chat", ["roleplay.chat.>"]),
             ("roleplay_events", ["roleplay.events.>"]),
@@ -118,41 +153,50 @@ class ActorAgent:
             try:
                 await self.js.add_stream(name=stream_name, subjects=subjects)
             except Exception:
+                # Stream already provisioned on the cluster mesh
                 pass
 
     async def close(self):
         if self.nc:
             await self.nc.close()
+            logger.info("NATS Connection dropped cleanly during shutdown sequence.")
 
     async def handle_user_message(self, data: dict):
-        conversation_id = data["conversation_id"]
+        conversation_id = data.get("conversation_id")
+        if not conversation_id:
+            logger.error("Malformed NATS payload received; missing core identifier 'conversation_id'")
+            return
 
+        # Fetch foundational conversation state, explicitly isolating the reserved keyword 'current_time'
         conv = await fetch_one(
             """SELECT c.id, c.scenario_id, c.ai_character_id, c.user_character_id,
-                   c.current_place, c.current_time, s.title, s.introduction
-            FROM conversations c JOIN scenarios s ON c.scenario_id = s.id WHERE c.id = %s
+                      c.current_place, c."current_time", s.title, s.introduction
+               FROM conversations c 
+               JOIN scenarios s ON c.scenario_id = s.id WHERE c.id = %s
             """,
             (conversation_id,),
         )
         if not conv:
-            logger.error("Conversation %s not found", conversation_id)
+            logger.error("Aborting generation loop: Conversation ID %s not registered in DB.", conversation_id)
             return
 
-        ai_char = await fetch_one(
-            "SELECT * FROM characters WHERE id = %s",
-            (conv["ai_character_id"],),
+        # Execute concurrent tasks for character configurations
+        ai_char_task = fetch_one("SELECT * FROM characters WHERE id = %s", (conv["ai_character_id"],))
+        user_char_task = (
+            fetch_one("SELECT * FROM characters WHERE id = %s", (conv["user_character_id"],))
+            if conv["user_character_id"] else asyncio.sleep(0, result=None)
         )
-        user_char = None
-        if conv["user_character_id"]:
-            user_char = await fetch_one(
-                "SELECT * FROM characters WHERE id = %s",
-                (conv["user_character_id"],),
-            )
+        
+        ai_char, user_char = await asyncio.gather(ai_char_task, user_char_task)
+        if not ai_char:
+            logger.error("Base processing error: Target AI character data sheet is blank.")
+            return
 
+        # Retrieve conversation window constraint maps
         recent_messages = await fetch_all(
             """SELECT sender, content FROM messages
-            WHERE conversation_id = %s
-            ORDER BY created_at DESC LIMIT 20
+               WHERE conversation_id = %s
+               ORDER BY created_at DESC LIMIT 10
             """,
             (conversation_id,),
         )
@@ -160,15 +204,24 @@ class ActorAgent:
 
         search_text = recent_messages[-1]["content"] if recent_messages else ""
         memories: List[dict] = []
+        
+        # Two-Stage Context Retrieval Pipeline (Vector Match -> Cross Encoder Rerank)
         if search_text:
             try:
+                # 1. Base Vector Match over the index (high Recall, lower Precision)
                 emb = await embed_texts([search_text])
-                memories = await search_similar(
-                    "conversations", emb[0], limit=5,
-                    filters={"must": [{"key": "conversation_id", "match": {"value": conversation_id}}]}
+                raw_vector_matches = await search_similar(
+                    collection="conversations",
+                    vector=emb[0],
+                    limit=8,  # Fetch top : candidates to allow accurate evaluation
+                    filters={"conversation_id": conversation_id}
                 )
+                
+                # 2. Local Cross-Encoder Reranking pass (high Precision filtering)
+                memories = rerank_documents(query=search_text, documents=raw_vector_matches, top_n=5)
+                
             except Exception as e:
-                logger.warning("Memory search failed: %s", e)
+                logger.warning("Context retrieval subsystem caught a non-breaking error: %s", e)
 
         system_prompt = _build_system_prompt(
             scenario=conv,
@@ -184,22 +237,30 @@ class ActorAgent:
             role = "user" if m["sender"] == "user" else "assistant"
             messages.append({"role": role, "content": m["content"]})
 
+        # Process Inference Window execution loops
         try:
             ai_content = await _call_llm(messages)
         except Exception as e:
-            logger.error("LLM call failed: %s", e)
+            logger.error("Inference cluster failed to generate prompt conclusions: %s", e)
             ai_content = "(The character seems lost in thought...)"
 
+        # Persistent storage integration updates
         ai_msg = await execute_returning(
             """
             INSERT INTO messages (conversation_id, sender, content, metadata)
             VALUES (%s, 'ai', %s, %s)
             RETURNING id, conversation_id, sender, content, created_at
             """,
-            (conversation_id, ai_content, json.dumps({"actor": True})),
+            (conversation_id, ai_content, json.dumps({"actor_version": "2.0", "reranked": True})),
         )
-        logger.info("Actor responded for conv=%s msg=%s", conversation_id, ai_msg["id"])
+        
+        if not ai_msg:
+            logger.critical("Database transaction failure saving response message for conversation %s", conversation_id)
+            return
 
+        logger.info("Actor responded successfully for conv=%s msg=%s", conversation_id, ai_msg["id"])
+
+        # Broadcast state changes across the worker grid
         try:
             await self.js.publish(
                 "roleplay.chat.ai_response",
@@ -210,11 +271,12 @@ class ActorAgent:
                 }).encode(),
             )
         except Exception as e:
-            logger.warning("Failed to publish ai_response: %s", e)
+            logger.warning("Event stream update drop warning: roleplay.chat.ai_response failed to publish: %s", e)
 
         return ai_msg["content"]
 
     async def run(self):
+        """Bind consumer loops and listen for event distributions indefinitely."""
         await self.connect()
         sub = await self.js.subscribe("roleplay.chat.user_message", durable="actor_agent")
         logger.info("Actor Agent listening on roleplay.chat.user_message")
@@ -225,7 +287,7 @@ class ActorAgent:
                 await self.handle_user_message(data)
                 await msg.ack()
             except Exception as e:
-                logger.error("Error processing message: %s", e)
+                logger.error("Error processing stream message transaction: %s", e)
                 await msg.nak()
 
         while True:
@@ -235,13 +297,25 @@ class ActorAgent:
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                logger.error("Actor loop error: %s", e)
-                await asyncio.sleep(1)
+                logger.error("Actor lifecycle main loop error caught: %s", e)
+                await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
-    agent = ActorAgent()
+    import sys
+    import selectors
+
+    agent = ActorAgent()  
     try:
-        asyncio.run(agent.run())
+        if sys.platform == "win32":
+            # Modern, warning-free way to force SelectorEventLoop on Windows for psycopg compatibility
+            def win_loop_factory():
+                return asyncio.SelectorEventLoop(selectors.SelectSelector())
+                
+            asyncio.run(agent.run(), loop_factory=win_loop_factory)
+        else:
+            # Linux/macOS run natively without modifications
+            asyncio.run(agent.run())
+            
     except KeyboardInterrupt:
-        logger.info("Actor Agent shutting down cleanly...")
+        logger.info("Agent shutting down cleanly via interface break request...")

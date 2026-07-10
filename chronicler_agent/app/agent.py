@@ -162,8 +162,20 @@ class ChroniclerAgent:
 
 
 if __name__ == "__main__":
-    agent = ChroniclerAgent()
+    import sys
+    import selectors
+
+    agent = ChroniclerAgent() 
     try:
-        asyncio.run(agent.run())
+        if sys.platform == "win32":
+            # Modern, warning-free way to force SelectorEventLoop on Windows for psycopg compatibility
+            def win_loop_factory():
+                return asyncio.SelectorEventLoop(selectors.SelectSelector())
+                
+            asyncio.run(agent.run(), loop_factory=win_loop_factory)
+        else:
+            # Linux/macOS run natively without modifications
+            asyncio.run(agent.run())
+            
     except KeyboardInterrupt:
-        logger.info("Chronicler Agent shutting down cleanly...")
+        logger.info("Agent shutting down cleanly via interface break request...")
