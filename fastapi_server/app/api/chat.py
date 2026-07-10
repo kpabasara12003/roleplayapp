@@ -66,9 +66,9 @@ async def start_conversation(
 
     conv = await execute_returning(
         """
-        INSERT INTO conversations (scenario_id, user_id, ai_character_id, user_character_id, current_place, current_time, status)
+        INSERT INTO conversations (scenario_id, user_id, ai_character_id, user_character_id, current_place, "current_time", status)
         VALUES (%s, %s, %s, %s, %s, %s, 'active')
-        RETURNING id, scenario_id, user_id, ai_character_id, user_character_id, current_place, current_time, status, created_at, updated_at
+        RETURNING id, scenario_id, user_id, ai_character_id, user_character_id, current_place, "current_time", status, created_at, updated_at
         """,
         (
             payload.scenario_id,

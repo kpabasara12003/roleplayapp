@@ -103,7 +103,7 @@ class DirectorAgent:
                 params.append(new_place)
                 logger.info("Director updated place for conv=%s -> %s", conversation_id, new_place)
             if new_time:
-                updates.append("current_time = %s")
+                updates.append('"current_time" = %s')
                 params.append(new_time)
                 logger.info("Director updated time for conv=%s -> %s", conversation_id, new_time)
 
@@ -137,6 +137,11 @@ class DirectorAgent:
 
 
 if __name__ == "__main__":
+    import sys
+    # FIXED: Force Windows to use SelectorEventLoop for psycopg compatibility
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     agent = DirectorAgent()
     try:
         asyncio.run(agent.run())

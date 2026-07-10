@@ -162,6 +162,11 @@ class ChroniclerAgent:
 
 
 if __name__ == "__main__":
+    import sys
+    #  FIXED: Force Windows to use SelectorEventLoop for psycopg compatibility
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     agent = ChroniclerAgent()
     try:
         asyncio.run(agent.run())
