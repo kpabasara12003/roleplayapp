@@ -1,3 +1,4 @@
+#roleplay_backend/app/api/chat.py
 import json
 from typing import Optional, List
 from datetime import datetime
@@ -6,8 +7,9 @@ from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisco
 from pydantic import BaseModel
 
 from shared.db.postgres import fetch_one, fetch_all, execute_returning
-from shared.db.qdrant import embed_texts, search_similar
 from shared.utils.nats_client import NATSPublisher
+from shared.schemas.protocol import OutboundWSEvent
+from fastapi_server.app.services.ws_manager import ws_manager
 from fastapi_server.app.api.users import get_current_user
 from shared.utils.logger import get_logger
 
@@ -16,17 +18,14 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 nats_publisher = NATSPublisher()
 
-
 class ChatStartRequest(BaseModel):
     scenario_id: int
     ai_character_id: int
     user_character_id: Optional[int] = None
 
-
 class ChatMessageRequest(BaseModel):
     conversation_id: int
     content: str
-
 
 class ChatMessageResponse(BaseModel):
     id: int
@@ -80,7 +79,7 @@ async def start_conversation(
         ),
     )
 
-    # Publish event to chronicler
+    # Publish durable transaction message
     payload_json = json.dumps({
         "event": "conversation_started",
         "conversation_id": conv["id"],
@@ -88,11 +87,7 @@ async def start_conversation(
     })
     await nats_publisher.publish("roleplay.events.conversation_started", payload_json.encode())
 
-    # If AI has a greeting, insert it as first message
-    ai_char_data = await fetch_one(
-        "SELECT greeting FROM characters WHERE id = %s",
-        (payload.ai_character_id,),
-    )
+    ai_char_data = await fetch_one("SELECT greeting FROM characters WHERE id = %s", (payload.ai_character_id,))
     greeting = ai_char_data.get("greeting") if ai_char_data else None
     if greeting:
         await execute_returning(
@@ -112,16 +107,13 @@ async def send_message(
     payload: ChatMessageRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Send a user message and trigger the Actor agent via NATS."""
+    """Fallback HTTP Message gateway routing straight into NATS processing."""
     conv = await fetch_one(
-        """
-        SELECT c.* FROM conversations c
-        WHERE c.id = %s AND c.user_id = %s AND c.status = 'active'
-        """,
+        "SELECT id FROM conversations WHERE id = %s AND user_id = %s AND status = 'active'",
         (payload.conversation_id, user["id"]),
     )
     if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found or inactive")
+        raise HTTPException(status_code=404, detail="Active conversation not found")
 
     msg = await execute_returning(
         """
@@ -132,115 +124,83 @@ async def send_message(
         (payload.conversation_id, payload.content, json.dumps({"source": "api"})),
     )
 
-    # Notify Actor agent via NATS
     event = {
         "event": "user_message",
         "conversation_id": conv["id"],
         "message_id": msg["id"],
         "user_id": user["id"],
+        "content": payload.content
     }
     await nats_publisher.publish("roleplay.chat.user_message", json.dumps(event).encode())
-
     return msg
 
 
 @router.get("/history/{conversation_id}", response_model=List[ChatMessageResponse])
-async def get_history(
-    conversation_id: int,
-    user: dict = Depends(get_current_user),
-):
-    rows = await fetch_all(
-        """
-        SELECT id, conversation_id, sender, content, created_at
-        FROM messages
-        WHERE conversation_id = %s
-        ORDER BY created_at ASC
-        """,
+async def get_history(conversation_id: int, user: dict = Depends(get_current_user)):
+    return await fetch_all(
+        """SELECT id, conversation_id, sender, content, created_at
+           FROM messages WHERE conversation_id = %s ORDER BY created_at ASC""",
         (conversation_id,),
     )
-    return rows
 
 
 @router.websocket("/ws/{conversation_id}")
 async def websocket_chat(websocket: WebSocket, conversation_id: int):
-    """WebSocket for real-time messaging."""
+    """Pure, decoupled real-time gateway pipeline channel."""
     api_key = websocket.query_params.get("api_key")
     if not api_key:
         await websocket.close(code=1008, reason="Missing api_key")
         return
 
-    user = await fetch_one(
-        "SELECT id, username FROM users WHERE api_key = %s",
-        (api_key,),
-    )
+    user = await fetch_one("SELECT id FROM users WHERE api_key = %s", (api_key,))
     if not user:
         await websocket.close(code=1008, reason="Invalid api_key")
         return
 
     conv = await fetch_one(
-        "SELECT id FROM conversations WHERE id = %s AND user_id = %s",
+        "SELECT id FROM conversations WHERE id = %s AND user_id = %s AND status = 'active'",
         (conversation_id, user["id"]),
     )
     if not conv:
-        await websocket.close(code=1008, reason="Conversation not found")
+        await websocket.close(code=1008, reason="Active conversation access denied")
         return
 
+    # Accept connection and transfer state registration to the live registry manager
     await websocket.accept()
-    
-    # Subscribe to NATS for live AI replies tailored to this conversation
-    sub = None
-    if nats_publisher.nc:
-        async def nats_handler(msg):
-            try:
-                data = json.loads(msg.data.decode())
-                await websocket.send_text(json.dumps(data))
-            except Exception as e:
-                logger.error("Error pushing NATS msg to websocket: %s", e)
-                
-        sub = await nats_publisher.nc.subscribe(f"roleplay.chat.reply.{conversation_id}", cb=nats_handler)
+    await ws_manager.connect(conversation_id, websocket)
 
     try:
         while True:
-            data = await websocket.receive_text()
+            raw_data = await websocket.receive_text()
             try:
-                req = json.loads(data)
-            except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({"error": "Invalid JSON"}))
+                packet = json.loads(raw_data)
+                content = packet.get("content", "").strip()
+            except Exception:
+                await websocket.send_text(json.dumps({"error": "Invalid JSON mapping structure"}))
                 continue
 
-            content = req.get("content", "").strip()
             if not content:
-                await websocket.send_text(json.dumps({"error": "Empty content"}))
                 continue
 
-            msg = await execute_returning(
-                """
-                INSERT INTO messages (conversation_id, sender, content, metadata)
-                VALUES (%s, 'user', %s, %s)
-                RETURNING id, conversation_id, sender, content, created_at
-                """,
-                (conversation_id, content, json.dumps({"source": "websocket"})),
-            )
-
-            # Publish to actor
+            # CRITICAL OPTIMIZATION: Emit a fire-and-forget message straight to NATS.
+            # We don't perform SQL block updates here. The Chronicler Agent handles database
+            # ingest, allowing the thread to instantly listen for more user actions.
             event = {
                 "event": "user_message",
                 "conversation_id": conversation_id,
-                "message_id": msg["id"],
                 "user_id": user["id"],
+                "content": content,
+                "timestamp": str(datetime.utcnow())
             }
-            await nats_publisher.publish(
-                "roleplay.chat.user_message", json.dumps(event).encode()
+            
+            # Broadcast user message through fast ephemeral channels
+            await nats_publisher.publish_ephemeral(
+                "roleplay.chat.user_message", 
+                json.dumps(event).encode()
             )
 
-            # Simple immediate response placeholder; in production, actor publishes back
-            await websocket.send_text(json.dumps({"status": "sent", "message_id": msg["id"]}))
-
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected for conv=%s", conversation_id)
+        logger.info("Connection tunnel dropped cleanly for conversation %s", conversation_id)
     finally:
-        if sub:
-            try:
-                await sub.unsubscribe()
-            except Exception:
-                pass
+        # Guarantee memory resource clearance to prevent active session leaks
+        await ws_manager.disconnect(conversation_id, websocket)

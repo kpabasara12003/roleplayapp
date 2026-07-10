@@ -2,6 +2,8 @@ import json
 import re
 import asyncio
 from typing import Optional
+import selectors
+import sys
 
 from nats.aio.client import Client as NATS
 
@@ -78,10 +80,18 @@ class DirectorAgent:
         if self.nc:
             await self.nc.close()
 
-    async def handle_ai_response(self, data: dict):
+    async def handle_ai_response(self, data: dict, subject: str):
+        # Defensive check: Try to extract conversation_id from JSON payload first, 
+        # fallback to extracting it from the NATS subject string if appended (e.g. roleplay.chat.ai_response.3)
         conversation_id = data.get("conversation_id")
+        if not conversation_id:
+            subject_parts = subject.split(".")
+            if len(subject_parts) > 3 and subject_parts[-1].isdigit():
+                conversation_id = int(subject_parts[-1])
+
         message_id = data.get("message_id")
         if not conversation_id or not message_id:
+            logger.warning("Director skipped message processing: missing conversation_id or message_id. Data: %s, Subject: %s", data, subject)
             return
 
         msg = await fetch_one(
@@ -89,9 +99,10 @@ class DirectorAgent:
             (message_id, conversation_id),
         )
         if not msg:
+            logger.warning("Director couldn't find database record for message_id=%s in conv_id=%s", message_id, conversation_id)
             return
+            
         text = msg["content"]
-
         new_place = _extract_place(text)
         new_time = _extract_time(text)
 
@@ -111,18 +122,36 @@ class DirectorAgent:
             sql = f"UPDATE conversations SET {', '.join(updates)} WHERE id = %s"
             await execute(sql, tuple(params))
 
+        # Outbound event broadcast back to the system to wake up your web socket gateway
+        event_payload = {
+            "event": "message_completed",
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "content": text,
+            "current_place": new_place,
+            "current_time": new_time
+        }
+        
+        event_subject = f"roleplay.events.updates.{conversation_id}"
+        await self.nc.publish(event_subject, json.dumps(event_payload).encode())
+        logger.info("Director successfully processed message and sent WebSocket trigger to subject=%s", event_subject)
+
     async def run(self):
         await self.connect()
-        sub = await self.js.subscribe("roleplay.chat.ai_response", durable="director_agent")
-        logger.info("Director Agent listening on roleplay.chat.ai_response")
+        
+        # FIX 1 & 2: Listen using a token wildcard (ai_response.>) to intercept conversation IDs, 
+        # and update the durable consumer name to 'director_agent_v3' to clear the NATS broker state cache.
+        sub = await self.js.subscribe("roleplay.chat.ai_response.>", durable="director_agent_v3")
+        logger.info("Director Agent successfully connected and sniffing on subject: roleplay.chat.ai_response.>")
 
         async def process(msg):
             try:
+                logger.info("DEBUG: Director caught an incoming message on NATS subject: %s", msg.subject)
                 data = json.loads(msg.data.decode()) if msg.data else {}
-                await self.handle_ai_response(data)
+                await self.handle_ai_response(data, msg.subject)
                 await msg.ack()
             except Exception as e:
-                logger.error("Director error: %s", e)
+                logger.error("Director error during processing execution: %s", e)
                 await msg.nak()
 
         while True:
@@ -132,22 +161,19 @@ class DirectorAgent:
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                logger.error("Director loop error: %s", e)
+                logger.error("Director operational loop error: %s", e)
                 await asyncio.sleep(1)
-if __name__ == "__main__":
-    import sys
-    import selectors
 
+
+if __name__ == "__main__":
     agent = DirectorAgent()  
     try:
         if sys.platform == "win32":
-            # Modern, warning-free way to force SelectorEventLoop on Windows for psycopg compatibility
             def win_loop_factory():
                 return asyncio.SelectorEventLoop(selectors.SelectSelector())
                 
             asyncio.run(agent.run(), loop_factory=win_loop_factory)
         else:
-            # Linux/macOS run natively without modifications
             asyncio.run(agent.run())
             
     except KeyboardInterrupt:

@@ -1,9 +1,11 @@
 """
-Roleplay AI Backend - FastAPI Server
+Roleplay AI Backend - FastAPI Server  fastapi_server/app/main.py
 Handles HTTP / WebSocket, Swagger docs, and routes messages to NATS.
 """
-
 import os
+import sys
+import selectors
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,34 +16,41 @@ from shared.db.postgres import close_pool
 from shared.utils.nats_client import NATSPublisher
 from shared.utils.logger import get_logger
 
+# Import the new consumer background routing agent
+from fastapi_server.app.workers.nats_consumer import nats_consumer_worker
 from fastapi_server.app.api import users, scenarios, characters, chat
 
 logger = get_logger(__name__)
 
 nats_pub = NATSPublisher()
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup & shutdown hooks."""
+    """Handles startup registration and clean teardown mechanics."""
     logger.info("Starting FastAPI server on port %s", settings.api_port)
+    
+    # Establish shared connection pool infrastructure
     await nats_pub.connect()
-    chat.nats_publisher.nc = nats_pub.nc  # Share connection with chat router
+    chat.nats_publisher.nc = nats_pub.nc  
     chat.nats_publisher.js = nats_pub.js
+    
+    # Launch the backplane NATS to WebSocket forwarder task
+    await nats_consumer_worker.start(nats_pub.nc)
+    
     yield
-    logger.info("Shutting down FastAPI server")
+    
+    logger.info("Shutting down FastAPI server framework...")
+    await nats_consumer_worker.stop()
     await close_pool()
     await nats_pub.close()
 
-
 app = FastAPI(
     title="Roleplay AI API",
-    description="Backend API for Roleplay AI Chat Application",
-    version="0.1.0",
+    description="Decoupled Bidirectional Backend Engine for Roleplay AI Chat",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,20 +59,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
 app.include_router(users.router)
 app.include_router(scenarios.router)
 app.include_router(characters.router)
 app.include_router(chat.router)
 
-
 @app.get("/health", tags=["Health"])
 async def health_check():
     return {"status": "ok"}
 
-
 if __name__ == "__main__":
     import uvicorn
+    
+    # Apply standard WindowsSelectorEventLoopPolicy setup implicitly if executing directly via CLI on Windows
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
     uvicorn.run(
         "fastapi_server.app.main:app",
         host="0.0.0.0",
