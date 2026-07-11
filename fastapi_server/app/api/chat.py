@@ -1,6 +1,7 @@
 #roleplay_backend/app/api/chat.py
 import json
 from typing import Optional, List
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect
@@ -33,6 +34,47 @@ class ChatMessageResponse(BaseModel):
     sender: str
     content: str
     created_at: datetime
+
+
+# Real-time NATS to WebSocket Bridge Worker
+async def nats_to_websocket_bridge():
+    """Background loop that listens to NATS channels and routes to the live WebSocket Manager."""
+    await nats_publisher.connect()
+    
+    # Safely extract the raw core NATS client instance from your custom wrapper
+    nc = getattr(nats_publisher, "nc", None) or getattr(nats_publisher, "_nc", None) or getattr(nats_publisher, "client", None)
+    
+    if not nc:
+        logger.error("Bridge Failure: Could not locate the raw NATS client inside NATSPublisher.")
+        return
+
+    async def message_handler(msg):
+        try:
+            subject = msg.subject
+            data = json.loads(msg.data.decode()) if msg.data else {}
+            
+            # Extract the active conversation_id from the end of the routing subject string
+            # e.g., "roleplay.chat.stream.3" -> 3
+            parts = subject.split(".")
+            conversation_id = int(parts[-1])
+            
+            # Route directly to our stateful memory connection registry
+            await ws_manager.broadcast_to_conversation(conversation_id, data)
+            logger.debug("Successfully fanned out event from subject %s to WebSocket", subject)
+            
+        except Exception as e:
+            logger.error("Failed to parse or route background NATS packet to WebSocket: %s", e)
+
+    # Listen directly to final AI outputs from Chronicler and context updates from Director
+    await nc.subscribe("roleplay.chat.stream.>", cb=message_handler)
+    await nc.subscribe("roleplay.events.updates.>", cb=message_handler)
+    logger.info("Real-time NATS-to-WebSocket messaging bridge connected and sniffing targets.")
+
+
+@router.on_event("startup")
+async def launch_background_bridge():
+    """Asynchronously starts our event router alongside the core FastAPI application worker."""
+    asyncio.create_task(nats_to_websocket_bridge())
 
 
 @router.post("/start", response_model=dict)
@@ -202,5 +244,4 @@ async def websocket_chat(websocket: WebSocket, conversation_id: int):
     except WebSocketDisconnect:
         logger.info("Connection tunnel dropped cleanly for conversation %s", conversation_id)
     finally:
-        # Guarantee memory resource clearance to prevent active session leaks
         await ws_manager.disconnect(conversation_id, websocket)
