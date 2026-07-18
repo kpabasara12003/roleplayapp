@@ -1,11 +1,13 @@
+# chronicler_agent/app/agent.py
 import os
 import sys
 import json
+import uuid  
 import asyncio
 import selectors
 from collections import defaultdict
 from typing import Dict
-from datetime import datetime, timezone  # FIX: Explicitly import timezone to prevent class attribute errors
+from datetime import datetime, timezone
 
 from shared.utils.nats_client import NATSPublisher
 from qdrant_client.models import PointStruct
@@ -42,7 +44,7 @@ class ChroniclerAgent:
         )
         parts = []
         for r in rows:
-            prefix = "User" if r["sender"] == "user" else "AI"
+            prefix = r["sender"].capitalize()
             parts.append(f"{prefix}: {r['content']}")
         summary = " | ".join(parts)
         return summary[:1500]
@@ -62,9 +64,7 @@ class ChroniclerAgent:
         inserted_msg_id = None
         sender_type = None
 
-        # -----------------------------------------------------------------
         # CASE 1: Inbound User Message Handling
-        # -----------------------------------------------------------------
         if event == "user_message" or "user_message" in subject:
             sender_type = "user"
             if "message_id" not in data:
@@ -84,9 +84,7 @@ class ChroniclerAgent:
                 inserted_msg_id = data["message_id"]
                 message_saved = True
 
-        # -----------------------------------------------------------------
         # CASE 2: Finished AI Generation Handling
-        # -----------------------------------------------------------------
         elif event == "ai_message_completed" or "ai_reply_completed" in subject:
             sender_type = "ai"
             logger.info("Persisting completely formulated AI generation block for conversation_id=%s", conversation_id)
@@ -104,9 +102,25 @@ class ChroniclerAgent:
                 inserted_msg_id = msg["id"]
                 message_saved = True
 
-        # -----------------------------------------------------------------
+        # CASE 3: Director Intervention Handling (FIXED: Now Saved to DB!)
+        elif event == "director_intervention_completed" or "director_update_completed" in subject:
+            sender_type = "director"
+            logger.info("Persisting Director environmental world update for conversation_id=%s", conversation_id)
+            metadata = data.get("metadata", {"director_version": "1.0-streaming", "intervention_executed": True})
+            
+            msg = await execute_returning(
+                """
+                INSERT INTO messages (conversation_id, sender, content, metadata)
+                VALUES (%s, 'director', %s, %s)
+                RETURNING id
+                """,
+                (conversation_id, content, json.dumps(metadata)),
+            )
+            if msg:
+                inserted_msg_id = msg["id"]
+                message_saved = True
+
         # POST-WRITE: Interface Synchronization & Summarization Evaluate
-        # -----------------------------------------------------------------
         if message_saved and inserted_msg_id:
             
             # Trigger Director Agent for AI Replies
@@ -123,7 +137,7 @@ class ChroniclerAgent:
                 )
                 logger.info("Chronicler forwarded context token validation to Director on subject=%s", director_subject)
 
-            # Send database index resolution back to the user via the fast ephemeral channel
+            # Send database index resolution back to the user via the fast durable channel
             await self._send_ui_confirmation(conversation_id, inserted_msg_id, sender_type, content)
             
             # Evaluate if the active message history requires long-term compression/upsert
@@ -134,14 +148,15 @@ class ChroniclerAgent:
         packet = {
             "event": "message_completed",
             "conversation_id": conversation_id,
-            "timestamp": str(datetime.now(timezone.utc)),  # FIX: Uses backward-compatible, warning-free UTC format
             "payload": {
                 "message_id": message_id,
                 "sender": sender,
                 "full_content": content
             }
         }
-        await self.nats_publisher.publish_ephemeral(
+        
+        # Durable publish forces NATS JetStream to track this packet and assign a sequence id.
+        await self.nats_publisher.publish(
             f"roleplay.chat.stream.{conversation_id}", 
             json.dumps(packet).encode()
         )
@@ -151,9 +166,14 @@ class ChroniclerAgent:
         total = await self._get_message_count(conversation_id)
         last_processed = _message_counts[conversation_id]
         
+        # FIX: Prevent the Memory Counter Trap after service restarts.
+        # If unsummarized history exceeds the threshold, allow immediate catch-up summarization.
         if last_processed == 0 and total > 0:
-            _message_counts[conversation_id] = total
-            last_processed = total
+            if total < settings.summarize_every_n:
+                _message_counts[conversation_id] = total
+                last_processed = total
+            else:
+                last_processed = total - settings.summarize_every_n
 
         delta = total - last_processed
         if delta < settings.summarize_every_n:
@@ -180,8 +200,12 @@ class ChroniclerAgent:
         try:
             vectors = await embed_texts([summary_text])
             
+            # FIX: Generate valid UUIDv5 point IDs to satisfy Qdrant schema validation
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{conversation_id}_{start_id}_{end_id}"))
+            lore_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"lore_{conversation_id}_{start_id}_{end_id}"))
+            
             point = PointStruct(
-                id=f"{conversation_id}_{start_id}_{end_id}",
+                id=point_id,
                 vector=vectors[0],
                 payload={
                     "conversation_id": conversation_id,
@@ -197,7 +221,7 @@ class ChroniclerAgent:
             )
             if conv:
                 lore_point = PointStruct(
-                    id=f"lore_{conversation_id}_{start_id}_{end_id}",
+                    id=lore_id,
                     vector=vectors[0],
                     payload={
                         "scenario_id": conv["scenario_id"],

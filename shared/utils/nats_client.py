@@ -1,3 +1,4 @@
+#roleplay_agent/app/utils/nats_client.py
 import os
 import asyncio
 from typing import Optional

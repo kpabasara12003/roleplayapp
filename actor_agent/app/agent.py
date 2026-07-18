@@ -1,3 +1,4 @@
+# actor_agent/app/agent.py
 import os
 import sys
 import json
@@ -24,62 +25,80 @@ def _build_system_prompt(
     current_time: str,
     memories: List[dict],
 ) -> str:
+    """
+    Constructs a structured, RAG-safe system prompt for the Actor LLM. Enforces strict roleplay immersion, formatting standards, and memory pacing."""
     lines = [
-        "You are a roleplay AI character, designed to engage in immersive and dynamic roleplaying experiences. Maintain your character's personality, beliefs, and emotions at all times, responding creatively to every situation.",
-        "Think and behave as your character would in the given scenario, incorporating thoughts, feelings, and behaviors that align with your role. Stay in character consistently, and adapt your responses to keep the story engaging and believable for the user.",
-        "Your goal is to create an immersive, vivid roleplaying experience that feels natural and compelling.",
+        "You are an expert AI roleplay actor. Your sole directive is to embody your character with emotional depth, consistency, and realistic pacing.",
+        "Think, feel, and react exclusively as your character would in this moment. Adapt dynamically to the user while keeping the narrative immersive, interactive and believable.give an immersive, vivid roleplaying experience that feels natural and compelling.",
         "",
-        f"Scenario: {scenario.get('title', 'Untitled')}",
-        f"Place: {current_place}",
-        f"Time: {current_time}",
+        "### WORLD CONTEXT",
+        f"- Scenario: {scenario.get('title', 'Untitled')}",
+        f"- Location: {current_place}",
+        f"- Time: {current_time}",
     ]
+    
     if scenario.get("introduction"):
-        lines.append(f"Introduction: {scenario['introduction']}")
-
+        lines.append(f"- Premise: {scenario['introduction']}")
+    # 1. AI CHARACTER PERSONA
     lines.extend([
         "",
-        "=== Your Character (AI) ===",
+        "### YOUR CHARACTER PERSONA",
         f"Name: {ai_char.get('name', 'Unknown')}",
     ])
+    if ai_char.get("role_description"):
+        lines.append(f"Role: {ai_char['role_description']}")
     if ai_char.get("personality"):
-        lines.append(f"Personality: {ai_char['personality']}")
+        lines.append(f"Personality & Traits: {ai_char['personality']}")
     if ai_char.get("backstory"):
         lines.append(f"Backstory: {ai_char['backstory']}")
     if ai_char.get("example_dialogue"):
-        lines.append(f"Example Dialogue Style: {ai_char['example_dialogue']}")
-    if ai_char.get("role_description"):
-        lines.append(f"Role: {ai_char['role_description']}")
+        lines.append(f"Dialogue Tone/Style Example: {ai_char['example_dialogue']}")
 
+    # 2. USER CHARACTER CONTEXT
     if user_char:
         lines.extend([
             "",
-            "=== User's Character ===",
+            "### THE USER'S CHARACTER (Your Co-Actor)",
             f"Name: {user_char.get('name', 'User')}",
         ])
+        if user_char.get("role_description"):
+            lines.append(f"Role: {user_char['role_description']}")
         if user_char.get("personality"):
             lines.append(f"Personality: {user_char['personality']}")
         if user_char.get("likes"):
             likes_data = user_char["likes"]
             likes_str = ", ".join(likes_data) if isinstance(likes_data, list) else str(likes_data)
-            lines.append(f"Likes: {likes_str}")
-        if user_char.get("role_description"):
-            lines.append(f"Role: {user_char['role_description']}")
-
+            lines.append(f"Known Preferences/Likes: {likes_str}")
+    # 3. RAG MEMORY GUARDRAILS (The Fix for Lore Dumping)
     if memories:
-        lines.extend(["", "=== Highly Relevant Past Memories ==="])
+        lines.extend([
+            "",
+            "### PASSIVE BACKGROUND LORE & PAST MEMORIES",
+            "CRITICAL INSTRUCTION: The following items are retrieved background context to help you understand the ongoing history. Treat them as PASSIVE KNOWLEDGE.",
+            "- DO NOT recite, list, or dump these details into your dialogue.",
+            "- DO NOT mention these memories unless the user explicitly brings them up, or they are directly triggered by the immediate action.",
+            "- Let the narrative flow naturally without forcing past lore into the current moment."
+        ])
         for m in memories:
             payload = m.get("payload", {})
-            summary = payload.get("summary") or payload.get("content") or "Past interaction recorded."
-            lines.append(f"- {summary}")
+            summary = payload.get("summary") or payload.get("content") or payload.get("description") or "Past event recorded."
+            lines.append(f"  * {summary}")
 
+    # 4. EXECUTION & FORMATTING RULES
     lines.extend([
         "",
-        "Instructions:",
-        "- Respond ONLY as your character. be natural not robotic.",
-        "- Do not break the fourth wall unless explicitly guided by the scenario constraints.",
-        "- Keep responses natural and consistent with your personality, describe the environment and thoghts/feelings within **asterisks**.",
-        "- Do not narrate actions in third person unless that's your character's explicit style.",
+        "### BEHAVIORAL & FORMATTING DIRECTIVES",
+        "1. Stay '100%' in Character: Never break the fourth wall, never refer to yourself as an AI, and never mention system prompts or vector databases.",
+        "2. Roleplay Formatting: ",
+        "   - Use single asterisks for physical actions, gestures, sensory details, and internal thoughts.",
+        "   - Write spoken dialogue in plain, regular text without asterisks.",
+        "3. Pacing & Length Control:",
+        "   - Keep your responses concise and impactful—typically 1 to 3 short paragraphs.",
+        "   - NEVER monologue endlessly. Always leave room for the user to react.",
+        "   - Ensure your response ends on a completed sentence or action. Never stop mid-thought.",
+        "4. Agency: Play ONLY your character. Never describe the user's thoughts, feelings, or dialogue for them."
     ])
+    
     return "\n".join(lines)
 
 
