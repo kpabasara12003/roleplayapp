@@ -1,5 +1,0 @@
-actor_agent
-chronicler_agent
-director_agent
-fastapi_server
-shared
