@@ -77,7 +77,7 @@ CREATE INDEX idx_conversations_status ON conversations(status);
 CREATE TABLE messages (
     id SERIAL PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    sender VARCHAR(10) NOT NULL CHECK (sender IN ('user', 'ai')),
+    sender VARCHAR(10) NOT NULL CHECK (sender IN ('user', 'ai', 'director', 'system')),
     content TEXT NOT NULL,
     metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
