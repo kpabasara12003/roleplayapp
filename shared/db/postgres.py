@@ -3,7 +3,6 @@ from contextlib import asynccontextmanager
 from typing import Any, List, Optional, Tuple
 from dotenv import load_dotenv
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from shared.utils.logger import get_logger

@@ -1,4 +1,3 @@
-from typing import List
 from pydantic_settings import BaseSettings
 
 
@@ -17,12 +16,7 @@ class Settings(BaseSettings):
     nats_user: str = ""
     nats_password: str = ""
     api_port: int = 8000
-    api_cors_origins: str = "http://localhost:3000"
     log_level: str = "INFO"
-
-    @property
-    def cors_list(self) -> List[str]:
-        return [origin.strip() for origin in self.api_cors_origins.split(",")]
 
     class Config:
         env_file = ".env"

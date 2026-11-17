@@ -1,20 +1,17 @@
 #director_agent/app/agent.py
-import os
 import sys
 import json
 import httpx
 import asyncio
 import selectors
-from typing import Optional, List, Any
+from typing import Optional, List
 from datetime import datetime
-from nats.aio.client import Client as NATS
 
-from shared.db.postgres import fetch_one, fetch_all, execute_returning
-from shared.db.qdrant import embed_texts, search_similar, rerank_documents
+from shared.db.postgres import fetch_one, fetch_all
 from shared.utils.nats_client import NATSPublisher
 from shared.utils.logger import get_logger
 from director_agent.app.config import settings
-from shared.schemas.engine import DirectorEvaluation, EngineMutation, MutationType
+from shared.schemas.engine import DirectorEvaluation
 
 logger = get_logger(__name__)
 
@@ -64,8 +61,9 @@ If no mutations occur and the action is normal, return an empty list `[]` for "m
 
 async def _evaluate_action(content: str, game_state: dict) -> DirectorEvaluation:
     """
-    Executes a fast, non-streaming LLM call to evaluate game state mutations.
-    Enforces a strict 3.2s timeout to prevent triggering FastAPI's 4.0s NATS RPC timeout.
+    Executes a non-streaming LLM call to evaluate game state mutations.
+    The 10s LLM budget leaves room for real evaluation while staying below the
+    gateway's 15s NATS RPC deadline, so slow calls no longer always fall back.
     """
     prompt = _build_evaluation_prompt(content, game_state)
     messages = [
@@ -76,7 +74,7 @@ async def _evaluate_action(content: str, game_state: dict) -> DirectorEvaluation
     payload = {
         "model": settings.llm_model,
         "messages": messages,
-        "max_tokens": 400,
+        "max_tokens": 800,
         "temperature": 0.1,  # Low temperature for deterministic JSON structuring
         "stream": False,
         # Uncomment the line below if using OpenAI or vLLM to enforce JSON mode natively:
@@ -89,8 +87,7 @@ async def _evaluate_action(content: str, game_state: dict) -> DirectorEvaluation
     }
 
     try:
-        #  FastAPI's 4.0s NATS request limit[cite: 2]
-        async with httpx.AsyncClient(timeout=3.2) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(settings.llm_api_url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -247,6 +244,7 @@ class DirectorAgent:
                     fallback = DirectorEvaluation(
                         reasoning="Fallback due to internal RPC processing exception.",
                         is_action_allowed=True,
+                        failure_explanation="",
                         mutations=[]
                     )
                     await msg.respond(fallback.model_dump_json().encode())

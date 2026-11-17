@@ -75,14 +75,13 @@ async def _ensure_collection_exists(collection_name: str):
 
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Call DO BGE-M3 inference endpoint with exponential backoff for 429 errors."""
     if not texts:
         return []
     
     if not BGE_URL or not BGE_KEY:
-        raise ValueError("Missing DIGITALOCEAN_BGE_URL or DIGITALOCEAN_BGE_KEY environment config.")
+        raise ValueError("Missing config.")
 
-    payload = {"input": texts, "model": "bge-m3"}
+    payload = {"input": texts, "model": "baai/bge-m3"}
     headers = {
         "Authorization": f"Bearer {BGE_KEY}",
         "Content-Type": "application/json",

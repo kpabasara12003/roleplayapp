@@ -1,8 +1,8 @@
 #roleplay_backend/app/schemas/engine.py
 from enum import Enum
 from typing import Annotated
-from pydantic import BaseModel, Field, conint
-from typing import Dict, List, Optional
+from pydantic import BaseModel, Field
+from typing import List, Optional
 class InventoryItem(BaseModel):
     id: str = Field(description="Unique lower-case item slug, e.g., 'rusty_iron_key'")
     name: str = Field(description="Display name of the item")

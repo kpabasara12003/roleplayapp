@@ -10,7 +10,6 @@ from nats.js.api import ConsumerConfig, DeliverPolicy
 from shared.utils.game_engine import GameEngine 
 from shared.db.postgres import fetch_one, fetch_all, execute_returning
 from shared.utils.nats_client import NATSPublisher
-from shared.schemas.protocol import OutboundWSEvent
 from fastapi_server.app.services.ws_manager import ws_manager
 from fastapi_server.app.api.users import get_current_user
 from shared.utils.logger import get_logger
@@ -276,12 +275,15 @@ async def websocket_chat(
 
                 logger.info("Requesting pre-flight action validation from Director microservice...")
                 
-                # C. Make a blocking request over NATS (timeout after 4 seconds)
+                # C. Make a blocking request over NATS. The Director runs a live LLM
+                # evaluation whose latency varies (measured 2.5-4.8s, cold start higher),
+                # so the RPC deadline must leave headroom above the Director's own
+                # LLM timeout (10s) instead of racing it.
                 nc = nats_publisher.nc  # Access raw NATS connection client
                 rpc_response = await nc.request(
                     "roleplay.director.validate_action",
                     json.dumps(rpc_payload).encode(),
-                    timeout=4.0
+                    timeout=15.0
                 )
 
                 raw_eval_dict = json.loads(rpc_response.data.decode())
