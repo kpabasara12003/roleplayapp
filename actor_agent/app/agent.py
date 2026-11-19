@@ -1,14 +1,16 @@
 # actor_agent/app/agent.py
-import os
+from shared.utils.observability import traced
 import sys
+import uuid
 import json
 import httpx
+from shared.utils.providers import admission, retry_delay
 import asyncio
 import selectors
-from typing import Optional, List, Any
-from datetime import datetime
+from typing import Optional, List
+from datetime import datetime, timezone
 
-from shared.db.postgres import fetch_one, fetch_all
+from shared.db.postgres import fetch_one, fetch_all, execute_returning, transaction
 from shared.db.qdrant import embed_texts, search_similar, rerank_documents
 from shared.utils.nats_client import NATSPublisher
 from shared.utils.logger import get_logger
@@ -102,11 +104,14 @@ def _build_system_prompt(
     return "\n".join(lines)
 
 
+@traced('provider.actor')
 async def _stream_llm(messages: List[dict]):
     """
     Executes a streaming inference call, yielding tokens one by one as they
     arrive from the LLM provider. Includes automated backoff handling for 429 errors.
     """
+    from shared.utils.context import budget_messages
+    messages = budget_messages(messages)
     payload = {
         "model": settings.llm_model,
         "messages": messages,
@@ -123,15 +128,16 @@ async def _stream_llm(messages: List[dict]):
         "Authorization": f"Bearer {settings.llm_api_key}",
     }
 
+    emitted = False
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with admission(settings.llm_api_url, len(json.dumps(messages))+settings.llm_max_tokens) as client:
                 async with client.stream("POST", settings.llm_api_url, headers=headers, json=payload) as resp:
                     
                     if resp.status_code == 429:
                         sleep_time = backoff_factor ** attempt
                         logger.warning("LLM Inference endpoint returned 429 Rate Limit. Retrying in %.1fs...", sleep_time)
-                        await asyncio.sleep(sleep_time)
+                        await retry_delay(attempt, resp.headers.get("Retry-After"))
                         continue
                     
                     resp.raise_for_status()
@@ -146,17 +152,19 @@ async def _stream_llm(messages: List[dict]):
                                 chunk_json = json.loads(data_str)
                                 token = chunk_json["choices"][0]["delta"].get("content", "")
                                 if token:
+                                    emitted = True
                                     yield token
                             except (json.JSONDecodeError, KeyError, IndexError):
                                 continue
                     return  # Successfully generated without errors, break retry loop
 
         except httpx.HTTPError as e:
-            if attempt == max_retries - 1:
+            if emitted or attempt == max_retries - 1:
                 logger.error("LLM execution ultimately failed after maximum retry attempts: %s", e)
                 raise e
-            await asyncio.sleep(backoff_factor ** attempt)
+            await retry_delay(attempt)
 
+    raise RuntimeError("Model provider rate limit retries exhausted")
 
 class ActorAgent:
     def __init__(self):
@@ -168,27 +176,14 @@ class ActorAgent:
         assert self.nats_publisher.js is not None
 
         # Subscribe using a durable consumer profile via JetStream
-        sub = await self.nats_publisher.js.subscribe(
-            "roleplay.chat.user_message", 
-            durable="actor_agent_stream_worker"
+        sub = await self.nats_publisher.js.pull_subscribe(
+            "roleplay.events.jobs.actor",
+            durable="actor_jobs_v3"
         )
         logger.info("Upgraded Actor Agent listening continuously on 'roleplay.chat.user_message'")
 
-        while True:
-            try:
-                msg = await sub.next_msg(timeout=2.0)
-                try:
-                    data = json.loads(msg.data.decode()) if msg.data else {}
-                    await self.handle_user_message(data)
-                    await msg.ack()
-                except Exception as e:
-                    logger.error("Error processing event pipeline payload: %s", e)
-                    await msg.nak()
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error("Actor lifecycle main loop error caught: %s", e)
-                await asyncio.sleep(2)
+        from shared.utils.worker import consume
+        await consume(self.nats_publisher, sub, self.handle_user_message)
 
     async def handle_user_message(self, data: dict):
         conversation_id = data.get("conversation_id")
@@ -200,6 +195,8 @@ class ActorAgent:
             return
 
         try:
+            if data.get("event_id") and await fetch_one("SELECT id FROM messages WHERE event_id=%s", ("actor-" + data["event_id"],)):
+                return
             # PIPELINE STATE 1: Broadcast 'processing_memory' state over Core NATS
             await self._send_ui_state(conversation_id, "processing_memory", "Querying vector profiles and cross-reranking records...")
 
@@ -231,8 +228,8 @@ class ActorAgent:
             # Retrieve conversational context history window
             recent_messages = await fetch_all(
                 """SELECT sender, content FROM messages
-                   WHERE conversation_id = %s
-                   ORDER BY created_at DESC LIMIT 10
+                   WHERE conversation_id = %s AND COALESCE(metadata->>'action_status','accepted') NOT IN ('blocked','pending')
+                   ORDER BY id DESC LIMIT 10
                 """,
                 (conversation_id,),
             )
@@ -244,17 +241,8 @@ class ActorAgent:
             
             if search_text:
                 try:
-                    # 1. Base Vector Match over Qdrant index
-                    emb = await embed_texts([search_text])
-                    raw_vector_matches = await search_similar(
-                        collection="conversations",
-                        vector=emb[0],
-                        limit=8,
-                        filters={"conversation_id": conversation_id}
-                    )
-                    
-                    # 2. Local Cross-Encoder Reranking filter pass
-                    memories = rerank_documents(query=search_text, documents=raw_vector_matches, top_n=5)
+                    from shared.utils.retrieval import retrieve
+                    memories = await retrieve(search_text,conversation_id,conv['scenario_id'],user_id)
                 except Exception as e:
                     logger.warning("Context retrieval subsystem caught a non-breaking error: %s", e)
 
@@ -268,10 +256,25 @@ class ActorAgent:
                 memories=memories,
             )
 
+            from shared.utils.game_engine import GameEngine
+            state = await GameEngine(self.nats_publisher).get_state(conversation_id)
+            system_prompt += '\nAuthoritative mechanical state: ' + json.dumps(state)
+            for field in ('appearance', 'likes', 'dislikes', 'scenario'):
+                if ai_char.get(field):
+                    system_prompt += '\n' + field + ': ' + str(ai_char[field])
             messages = [{"role": "system", "content": system_prompt}]
             for m in recent_messages:
                 role = "user" if m["sender"] == "user" else "assistant"
                 messages.append({"role": role, "content": m["content"]})
+
+            # A durable input ID fences context to the triggering turn.
+            if data.get("message_id"):
+                recent_messages = await fetch_all("SELECT sender, content FROM messages WHERE conversation_id=%s AND id<=%s AND COALESCE(metadata->>'action_status','accepted') NOT IN ('blocked','pending') ORDER BY id DESC LIMIT 10", (conversation_id, data["message_id"]))
+                recent_messages.reverse()
+                messages = [{"role": "system", "content": system_prompt}]
+                messages.extend({"role": "user" if m["sender"] == "user" else "assistant", "content": m["content"]} for m in recent_messages)
+            elif not recent_messages or recent_messages[-1]["content"] != user_content:
+                messages.append({"role": "user", "content": user_content})
 
             # PIPELINE STATE 2: Broadcast 'typing' state to trigger immediate bubble UI animation
             await self._send_ui_state(conversation_id, "typing", f"{ai_char.get('name', 'AI')} is formulating an action...")
@@ -285,27 +288,32 @@ class ActorAgent:
                     full_response_text += token
                     await self._send_ui_chunk(conversation_id, token, index)
                     index += 1
-            except Exception as llm_err:
-                logger.error("Inference pipeline stream dropped mid-generation: %s", llm_err)
-                full_response_text = "*(The character looks down, temporarily lost in thought...)*"
-                await self._send_ui_chunk(conversation_id, full_response_text, index)
+            except Exception:
+                await self._send_ui_state(conversation_id, 'retrying', 'Generation interrupted; retrying the current turn')
+                raise
+            if not full_response_text.strip():
+                raise RuntimeError('Provider returned an empty reply')
 
             # PIPELINE STATE 4: Hand off final text payload out-of-band to Chronicler Agent
             # We don't perform SQL block inserts here. We broadcast the finished log event to NATS JetStream
             # and immediately return back to standby, keeping the worker unblocked.
             chronicler_payload = {
+                "event_id": "actor-" + str(data.get("event_id") or uuid.uuid4()),
+                "turn_id": data.get("turn_id"),
                 "event": "ai_message_completed",
                 "conversation_id": conversation_id,
                 "user_id": user_id,
                 "content": full_response_text,
                 "metadata": {"actor_version": "2.5-streaming", "reranked": True},
-                "timestamp": str(datetime.utcnow())
+                "timestamp": str(datetime.now(timezone.utc))
             }
             
-            await self.nats_publisher.publish(
-                "roleplay.chat.ai_reply_completed", 
-                json.dumps(chronicler_payload).encode()
-            )
+            async with transaction():
+                saved = await execute_returning("INSERT INTO messages(conversation_id,sender,content,metadata,event_id) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(event_id) DO UPDATE SET event_id=EXCLUDED.event_id RETURNING id", (conversation_id, "ai", chronicler_payload["content"], json.dumps(chronicler_payload["metadata"]), chronicler_payload["event_id"]))
+                chronicler_payload["message_id"] = saved["id"]
+                await self.nats_publisher.publish("roleplay.chat.ai_reply_completed", json.dumps(chronicler_payload).encode())
+                from shared.utils.turns import complete_job
+                await complete_job(chronicler_payload)
 
             # Close transaction cycle on frontend side
             await self._send_ui_state(conversation_id, "completed", "Streaming cycle executed cleanly.")
@@ -313,14 +321,15 @@ class ActorAgent:
 
         except Exception as e:
             logger.error("Fatal failure running Actor Agent processing segment: %s", e)
-            await self._send_ui_error(conversation_id, str(e))
+            await self._send_ui_error(conversation_id, "Agent processing failed; please retry.")
+            raise
 
     async def _send_ui_state(self, conversation_id: int, state: str, message: str):
         """Ships state updates over core ephemeral subjects directly to active connections."""
         packet = {
             "event": "state_change",
             "conversation_id": conversation_id,
-            "timestamp": str(datetime.utcnow()),
+            "timestamp": str(datetime.now(timezone.utc)),
             "payload": {
                 "state": state,
                 "message": message
@@ -336,7 +345,7 @@ class ActorAgent:
         packet = {
             "event": "text_chunk",
             "conversation_id": conversation_id,
-            "timestamp": str(datetime.utcnow()),
+            "timestamp": str(datetime.now(timezone.utc)),
             "payload": {
                 "chunk": chunk,
                 "index": index
@@ -352,7 +361,7 @@ class ActorAgent:
         packet = {
             "event": "state_change",
             "conversation_id": conversation_id,
-            "timestamp": str(datetime.utcnow()),
+            "timestamp": str(datetime.now(timezone.utc)),
             "payload": {
                 "state": "error",
                 "error_detail": error_msg
@@ -365,13 +374,14 @@ class ActorAgent:
 
 
 if __name__ == "__main__":
+    from shared.utils.worker import run_agent
     agent = ActorAgent()
     try:
         if sys.platform == "win32":
             def win_loop_factory():
                 return asyncio.SelectorEventLoop(selectors.SelectSelector())
-            asyncio.run(agent.run(), loop_factory=win_loop_factory)
+            asyncio.run(run_agent(agent), loop_factory=win_loop_factory)
         else:
-            asyncio.run(agent.run())
+            asyncio.run(run_agent(agent))
     except KeyboardInterrupt:
         logger.info("Agent shutting down cleanly via interface break request...")

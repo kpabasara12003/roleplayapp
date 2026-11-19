@@ -14,14 +14,20 @@ env/
 
 .cache
 .pytest_cache/
+build/
+*.egg-info/
 
-frontend/
+
 .vscode/
 .idea/
 
 *.log
-
+logs/
+.sh
 .env
-
-SPEC.md
+tools/
+tests/
+.md
 .opencodeignore
+.sql
+migrations/

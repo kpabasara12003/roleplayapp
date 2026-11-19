@@ -7,7 +7,20 @@ name = "roleplay-backend"
 version = "0.1.0"
 description = "Roleplay AI Chat Backend"
 requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.115", "uvicorn[standard]>=0.34", "websockets>=14",
+    "psycopg[binary,pool]>=3.2", "httpx>=0.28", "pydantic[email]>=2.10",
+    "pydantic-settings>=2.7", "python-dotenv>=1.0", "argon2-cffi>=23.1",
+    "nats-py>=2.9", "qdrant-client>=1.13", "FlashRank>=0.2.10",
+    "redis>=5", "opentelemetry-api>=1.30", "opentelemetry-sdk>=1.30",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["shared*", "fastapi_server*", "actor_agent*", "chronicler_agent*", "director_agent*"]
+
+[tool.setuptools.data-files]
+"share/roleplay/migrations" = ["migrations/*.sql"]
+
+[project.optional-dependencies]
+telemetry = ["opentelemetry-exporter-otlp-proto-http>=1.30"]

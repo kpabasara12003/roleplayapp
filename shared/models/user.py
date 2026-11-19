@@ -1,12 +1,17 @@
 from typing import Optional
 from datetime import datetime
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class UserRegister(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
     email: Optional[EmailStr] = None
+
+    @field_validator('email', mode='before')
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
 
 
 class UserLogin(BaseModel):

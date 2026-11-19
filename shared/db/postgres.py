@@ -1,4 +1,5 @@
 import os
+from contextvars import ContextVar
 from contextlib import asynccontextmanager
 from typing import Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -13,6 +14,27 @@ load_dotenv()
 logger = get_logger(__name__)
 
 _pool: Optional[AsyncConnectionPool] = None
+_transaction_conn = ContextVar('transaction_conn', default=None)
+
+
+@asynccontextmanager
+async def transaction():
+    """Share one atomic transaction across service and engine helpers."""
+    if _transaction_conn.get() is not None:
+        yield _transaction_conn.get()
+        return
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            token = _transaction_conn.set(conn)
+            try:
+                from shared.utils.turns import job_claim, assert_claim
+                claim = job_claim.get()
+                if claim:
+                    await assert_claim(claim)
+                yield conn
+            finally:
+                _transaction_conn.reset(token)
 
 
 async def get_pool() -> AsyncConnectionPool:
@@ -50,6 +72,10 @@ async def close_pool():
 @asynccontextmanager
 async def get_conn():
     """Yield a connection from the pool as an async context manager."""
+    current = _transaction_conn.get()
+    if current is not None:
+        yield current
+        return
     pool = await get_pool()
     async with pool.connection() as conn:
         yield conn
@@ -76,7 +102,8 @@ async def execute(sql: str, params: Tuple[Any, ...] = ()) -> int:
     async with get_conn() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, params)
-            await conn.commit()
+            if _transaction_conn.get() is None:
+                await conn.commit()
             return cur.rowcount
 
 
@@ -86,5 +113,6 @@ async def execute_returning(sql: str, params: Tuple[Any, ...] = ()) -> Optional[
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(sql, params)
             row = await cur.fetchone()
-            await conn.commit()
+            if _transaction_conn.get() is None:
+                await conn.commit()
             return row

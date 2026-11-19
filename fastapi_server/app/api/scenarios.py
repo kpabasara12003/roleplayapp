@@ -1,7 +1,8 @@
 from typing import List
+import json
 from fastapi import APIRouter, HTTPException, Depends
 
-from shared.db.postgres import fetch_one, fetch_all, execute, execute_returning
+from shared.db.postgres import fetch_one, fetch_all, execute, execute_returning, transaction
 from shared.models.scenario import ScenarioCreate, ScenarioUpdate, ScenarioOut
 from fastapi_server.app.api.users import get_current_user
 
@@ -15,9 +16,9 @@ async def create_scenario(
 ):
     row = await execute_returning(
         """
-        INSERT INTO scenarios (user_id, title, greeting, place, time, introduction, is_public)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, created_at, updated_at
+        INSERT INTO scenarios (user_id, title, greeting, place, time, introduction, is_public,rules)
+        VALUES (%s, %s, %s, %s, %s, %s, %s,%s::jsonb)
+        RETURNING *
         """,
         (
             user["id"],
@@ -27,6 +28,7 @@ async def create_scenario(
             payload.time,
             payload.introduction,
             payload.is_public,
+            payload.rules.model_dump_json(),
         ),
     )
     if not row:
@@ -38,7 +40,7 @@ async def create_scenario(
 async def list_scenarios(user: dict = Depends(get_current_user)):
     rows = await fetch_all(
         """
-        SELECT id, user_id, title, greeting, place, time, introduction, is_public, created_at, updated_at
+        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, created_at, updated_at
         FROM scenarios WHERE user_id = %s ORDER BY created_at DESC
         """,
         (user["id"],),
@@ -50,7 +52,7 @@ async def list_scenarios(user: dict = Depends(get_current_user)):
 async def get_scenario(scenario_id: int, user: dict = Depends(get_current_user)):
     row = await fetch_one(
         """
-        SELECT id, user_id, title, greeting, place, time, introduction, is_public, created_at, updated_at
+        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, created_at, updated_at
         FROM scenarios WHERE id = %s AND user_id = %s
         """,
         (scenario_id, user["id"]),
@@ -69,6 +71,9 @@ async def update_scenario(
     # Build dynamic SET clause safely
     fields = []
     values = []
+    if payload.rules is not None:
+        fields.append('rules=%s::jsonb')
+        values.append(payload.rules.model_dump_json())
     if payload.title is not None:
         fields.append("title = %s")
         values.append(payload.title)
@@ -95,7 +100,7 @@ async def update_scenario(
     sql = f"""
         UPDATE scenarios SET {', '.join(fields)}
         WHERE id = %s AND user_id = %s
-        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, created_at, updated_at
+        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, rules, created_at, updated_at
     """
     row = await execute_returning(sql, tuple(values))
     if not row:
@@ -105,10 +110,15 @@ async def update_scenario(
 
 @router.delete("/{scenario_id}", status_code=204)
 async def delete_scenario(scenario_id: int, user: dict = Depends(get_current_user)):
-    count = await execute(
-        "DELETE FROM scenarios WHERE id = %s AND user_id = %s",
-        (scenario_id, user["id"]),
-    )
-    if count == 0:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+    from fastapi_server.app.api.chat import nats_publisher
+    async with transaction():
+        from shared.db.postgres import get_conn
+        async with get_conn() as conn:
+            await conn.execute('SELECT pg_advisory_xact_lock(%s)',(2000000000+scenario_id,))
+        owned = await fetch_one('SELECT id FROM scenarios WHERE id=%s AND user_id=%s FOR UPDATE', (scenario_id,user['id']))
+        if not owned:
+            raise HTTPException(status_code=404, detail='Scenario not found')
+        conversations = await fetch_all('SELECT id FROM conversations WHERE scenario_id=%s', (scenario_id,))
+        await execute('DELETE FROM scenarios WHERE id=%s', (scenario_id,))
+        await nats_publisher.publish('roleplay.events.scenario_deleted', json.dumps({'scenario_id':scenario_id,'conversation_ids':[c['id'] for c in conversations]}).encode())
     return None

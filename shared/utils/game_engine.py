@@ -1,7 +1,8 @@
 #roleplay_backend/app/utils/game_engine.py
 import json
+import copy
 from shared.schemas.engine import DirectorEvaluation, MutationType
-from shared.db.postgres import execute, fetch_one
+from shared.db.postgres import execute, fetch_one, transaction
 from shared.utils.nats_client import NATSPublisher
 
 class GameEngine:
@@ -11,18 +12,19 @@ class GameEngine:
     async def get_state(self, conversation_id: int) -> dict:
         """Retrieves and normalizes the active game state matrix."""
         query = """
-            SELECT gs.inventory, gs.relationships, gs.quest_flags, c.current_place, c."current_time"
+            SELECT gs.inventory, gs.relationships, gs.quest_flags, c.current_place, c."current_time",c.state_version
             FROM conversations c
             LEFT JOIN game_states gs ON c.id = gs.conversation_id
             WHERE c.id = %s
         """
         # Explicitly passing a single-item tuple matching your signature requirements
         row = await fetch_one(query, (conversation_id,))
-        
+
         if not row:
             return {"inventory": [], "relationships": {}, "quest_flags": [], "place": "Unknown", "time": "Unknown"}
-        
+
         return {
+            "state_version": row['state_version'],
             "inventory": row.get("inventory") or [],
             "relationships": row.get("relationships") or {},
             "quest_flags": row.get("quest_flags") or [],
@@ -35,6 +37,7 @@ class GameEngine:
         if not evaluation.is_action_allowed:
             return
 
+        current_state = copy.deepcopy(current_state)
         # Turn list into dictionary mapping to handle additions/deletions cleanly
         inventory = {item["id"]: item for item in current_state["inventory"]}
         relationships = current_state["relationships"]
@@ -54,9 +57,11 @@ class GameEngine:
                         "description": mutation.description,
                         "quantity": mutation.value_change or 1
                     }
-            
+
             elif mutation.type == MutationType.ITEM_REMOVED:
                 item_id = mutation.target.lower().replace(" ", "_")
+                if item_id not in inventory or inventory[item_id]["quantity"] < (mutation.value_change or 1):
+                    raise ValueError("Insufficient inventory quantity")
                 if item_id in inventory:
                     inventory[item_id]["quantity"] -= (mutation.value_change or 1)
                     if inventory[item_id]["quantity"] <= 0:
@@ -67,7 +72,7 @@ class GameEngine:
                 score_change = mutation.value_change or 0
                 if char not in relationships:
                     relationships[char] = {"character_name": char, "affinity_score": 0, "relationship_status": "Stranger"}
-                
+
                 new_score = max(-100, min(100, relationships[char]["affinity_score"] + score_change))
                 relationships[char]["affinity_score"] = new_score
 
@@ -80,31 +85,40 @@ class GameEngine:
             elif mutation.type == MutationType.TIME_CHANGED:
                 new_time = mutation.target
 
-        # 1. Update Core Conversation Fields (Using your Tuple[Any, ...] style)
-        await execute(
-            "UPDATE conversations SET current_place = %s, \"current_time\" = %s WHERE id = %s",
-            (new_place, new_time, conversation_id)
-        )
-        
-        # 2. Write/Upsert Game States 
-        # Note the explicit inline conversions (%s::jsonb, %s::text[]) inside the SQL string!
-        # This prevents type mismatch crashes when drivers process stringified elements.
-        upsert_query = """  
-            INSERT INTO game_states (conversation_id, inventory, relationships, quest_flags)
-            VALUES (%s, %s::jsonb, %s::jsonb, %s::text[])
-            ON CONFLICT (conversation_id) DO UPDATE 
-            SET inventory = EXCLUDED.inventory, 
-                relationships = EXCLUDED.relationships, 
-                quest_flags = EXCLUDED.quest_flags
-        """
-        upsert_params = (
-            conversation_id, 
-            json.dumps(list(inventory.values())), 
-            json.dumps(relationships), 
-            list(quest_flags)
-        )
-        
-        await execute(upsert_query, upsert_params)
+        async with transaction():
+            version = await fetch_one('SELECT state_version FROM conversations WHERE id=%s FOR UPDATE', (conversation_id,))
+            if not version or version['state_version'] != current_state.get('state_version',0):
+                raise ValueError('Scene changed while evaluating action')
+            # 1. Update Core Conversation Fields (Using your Tuple[Any, ...] style)
+            await execute(
+                "UPDATE conversations SET current_place = %s, \"current_time\" = %s WHERE id = %s",
+                (new_place, new_time, conversation_id)
+            )
+
+            # 2. Write/Upsert Game States
+            # Note the explicit inline conversions (%s::jsonb, %s::text[]) inside the SQL string!
+            # This prevents type mismatch crashes when drivers process stringified elements.
+            upsert_query = """
+                INSERT INTO game_states (conversation_id, inventory, relationships, quest_flags)
+                VALUES (%s, %s::jsonb, %s::jsonb, %s::text[])
+                ON CONFLICT (conversation_id) DO UPDATE
+                SET inventory = EXCLUDED.inventory,
+                    relationships = EXCLUDED.relationships,
+                    quest_flags = EXCLUDED.quest_flags
+            """
+            upsert_params = (
+                conversation_id,
+                json.dumps(list(inventory.values())),
+                json.dumps(relationships),
+                list(quest_flags)
+            )
+
+            await execute(upsert_query, upsert_params)
+            await execute('UPDATE conversations SET state_version=state_version+1 WHERE id=%s',(conversation_id,))
+            from shared.utils.turns import job_claim
+            claim = job_claim.get()
+            if claim:
+                await execute('UPDATE turns SET state_version=state_version+1 WHERE id=%s',(claim.turn_id,))
 
         # 3. Broadcast execution state details via NATS stream pipeline channel
         ui_package = {
@@ -118,4 +132,4 @@ class GameEngine:
                 "relationships": relationships
             }
         }
-        await self.nats.publish(f"roleplay.chat.engine.{conversation_id}", json.dumps(ui_package).encode())
+        await self.nats.publish(f"roleplay.chat.stream.{conversation_id}", json.dumps(ui_package).encode())
