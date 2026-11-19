@@ -16,8 +16,8 @@ async def create_scenario(
 ):
     row = await execute_returning(
         """
-        INSERT INTO scenarios (user_id, title, greeting, place, time, introduction, is_public,rules)
-        VALUES (%s, %s, %s, %s, %s, %s, %s,%s::jsonb)
+        INSERT INTO scenarios (user_id, title, greeting, place, time, introduction, is_public,rules,initial_state)
+        VALUES (%s, %s, %s, %s, %s, %s, %s,%s::jsonb,%s::jsonb)
         RETURNING *
         """,
         (
@@ -29,6 +29,7 @@ async def create_scenario(
             payload.introduction,
             payload.is_public,
             payload.rules.model_dump_json(),
+            payload.initial_state.model_dump_json(),
         ),
     )
     if not row:
@@ -40,8 +41,8 @@ async def create_scenario(
 async def list_scenarios(user: dict = Depends(get_current_user)):
     rows = await fetch_all(
         """
-        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, created_at, updated_at
-        FROM scenarios WHERE user_id = %s ORDER BY created_at DESC
+        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
+        FROM scenarios WHERE deleted_at IS NULL AND user_id = %s ORDER BY created_at DESC
         """,
         (user["id"],),
     )
@@ -52,8 +53,8 @@ async def list_scenarios(user: dict = Depends(get_current_user)):
 async def get_scenario(scenario_id: int, user: dict = Depends(get_current_user)):
     row = await fetch_one(
         """
-        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, created_at, updated_at
-        FROM scenarios WHERE id = %s AND user_id = %s
+        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
+        FROM scenarios WHERE deleted_at IS NULL AND id = %s AND user_id = %s
         """,
         (scenario_id, user["id"]),
     )
@@ -71,6 +72,9 @@ async def update_scenario(
     # Build dynamic SET clause safely
     fields = []
     values = []
+    if payload.initial_state is not None:
+        fields.append('initial_state=%s::jsonb')
+        values.append(payload.initial_state.model_dump_json())
     if payload.rules is not None:
         fields.append('rules=%s::jsonb')
         values.append(payload.rules.model_dump_json())
@@ -100,7 +104,7 @@ async def update_scenario(
     sql = f"""
         UPDATE scenarios SET {', '.join(fields)}
         WHERE id = %s AND user_id = %s
-        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, rules, created_at, updated_at
+        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
     """
     row = await execute_returning(sql, tuple(values))
     if not row:
@@ -118,7 +122,5 @@ async def delete_scenario(scenario_id: int, user: dict = Depends(get_current_use
         owned = await fetch_one('SELECT id FROM scenarios WHERE id=%s AND user_id=%s FOR UPDATE', (scenario_id,user['id']))
         if not owned:
             raise HTTPException(status_code=404, detail='Scenario not found')
-        conversations = await fetch_all('SELECT id FROM conversations WHERE scenario_id=%s', (scenario_id,))
-        await execute('DELETE FROM scenarios WHERE id=%s', (scenario_id,))
-        await nats_publisher.publish('roleplay.events.scenario_deleted', json.dumps({'scenario_id':scenario_id,'conversation_ids':[c['id'] for c in conversations]}).encode())
+        await execute('UPDATE scenarios SET deleted_at=now(),is_public=false WHERE id=%s', (scenario_id,))
     return None

@@ -33,7 +33,6 @@ EMBED_DIM = 1024  # BGE-M3 standard vector dimensions
 COLLECTIONS = {
     "conversations": "Long-term chat history memory",
     "lorebook": "Pre-defined world info",
-    "characters": "Character traits for consistency",
 }
 
 _client: Optional[AsyncQdrantClient] = None
@@ -85,7 +84,7 @@ async def _initialize_collection(collection_name: str):
         vectors = info.config.params.vectors
         if getattr(vectors, 'size', None) != EMBED_DIM:
             raise ValueError('Qdrant vector schema does not match configured embedding dimensions')
-        for field in ('conversation_id', 'scenario_id'):
+        for field in ('conversation_id', 'scenario_id','scenario_version_id'):
             await client.create_payload_index(collection_name, field_name=field, field_schema=PayloadSchemaType.INTEGER, wait=True)
     except Exception as e:
         logger.error("Failed to verify/create Qdrant collection %s: %s", collection_name, e)

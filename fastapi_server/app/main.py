@@ -13,7 +13,7 @@ from shared.db.postgres import close_pool
 from shared.utils.nats_client import NATSPublisher
 from shared.utils.logger import get_logger
 
-from fastapi_server.app.api import users, scenarios, characters, chat, lore
+from fastapi_server.app.api import users, scenarios, characters, chat, lore, playthroughs, story_controls
 
 logger = get_logger(__name__)
 
@@ -67,6 +67,8 @@ app.include_router(scenarios.router)
 app.include_router(characters.router)
 app.include_router(chat.router)
 app.include_router(lore.router)
+app.include_router(playthroughs.router)
+app.include_router(story_controls.router)
 
 @app.middleware('http')
 async def trace_request(request,call_next):

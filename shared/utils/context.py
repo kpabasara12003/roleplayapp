@@ -1,18 +1,26 @@
-"""Conservative character budget when a provider tokenizer is unavailable."""
-def budget_messages(messages, max_chars=24000):
-    system = messages[0]['content']
-    # Preserve the final behavioral rules as well as the scenario/persona header.
-    if len(system) > max_chars // 2:
-        keep = max_chars // 2
-        system = system[:keep-4000] + '\n[Context abbreviated]\n' + system[-4000:]
-    remaining = max_chars - len(system)
-    tail = []
+"""Token budgets preserve essential state and the complete latest input."""
+import os
+
+def token_count(text,model=None):
+    try:
+        import tiktoken
+        return len(tiktoken.encoding_for_model(model or os.getenv('LLM_MODEL','')).encode(text))
+    except (ImportError,KeyError):
+        return len(text.encode('utf-8'))
+
+def budget_messages(messages,max_chars=None):
+    limit=int(os.getenv('MODEL_CONTEXT_TOKENS','8192'))-int(os.getenv('LLM_MAX_TOKENS','512'))-256
+    if max_chars is not None:
+        limit=min(limit,max_chars//4)
+    remaining=limit-token_count(messages[0]['content'])-8
+    if remaining<=0:
+        raise ValueError('Essential scenario/state exceeds model context budget')
+    tail=[]
     for message in reversed(messages[1:]):
-        content = message['content']
-        if len(content) > remaining:
-            if not tail:
-                tail.append({**message, 'content': content[-remaining:]})
+        cost=token_count(message['content'])+8
+        if cost>remaining:
+            if not tail: raise ValueError('Latest player input exceeds remaining model context')
             break
         tail.append(message)
-        remaining -= len(content)
-    return [{'role':'system','content':system}] + list(reversed(tail))
+        remaining-=cost
+    return [messages[0]]+list(reversed(tail))

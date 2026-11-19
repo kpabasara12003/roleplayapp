@@ -11,13 +11,14 @@ from shared.utils.providers import admission
 @traced('director.world')
 async def narrate_world(publisher,data):
     cid = data['conversation_id']
-    scene = await fetch_one('SELECT s.rules FROM scenarios s JOIN conversations c ON c.scenario_id=s.id WHERE c.id=%s',(cid,))
+    from shared.utils.playthroughs import scene_for
+    scene=await scene_for(cid)
     state = await GameEngine(publisher).get_state(cid)
     count = await fetch_one("SELECT count(*) AS n FROM turns WHERE conversation_id=%s AND status='completed'",(cid,))
     eligible = [event for event in scene['rules'].get('world_events',[]) if
-        set(event.get('requires_flags',[])).issubset(state['quest_flags']) and
+        set(event.get('requires_flags',[])).issubset(set(state['quest_flags'])|set(state.get('runtime',{}).get('executed_rules',[]))) and
         count['n']>=event.get('min_turns',0) and
-        (not event.get('once',True) or 'world:'+event['id'] not in state['quest_flags'])]
+        (not event.get('once',True) or 'world:'+event['id'] not in state['quest_flags']+state.get('runtime',{}).get('executed_rules',[]))]
     if not eligible:
         await complete_job()
         return
@@ -36,9 +37,6 @@ async def narrate_world(publisher,data):
     if selected and not event:
         raise ValueError('Director selected an unauthorized world event')
     async with transaction():
-        current=await fetch_one('SELECT s.rules FROM scenarios s JOIN conversations c ON c.scenario_id=s.id WHERE c.id=%s',(cid,))
-        if not current or current['rules']!=scene['rules']:
-            raise RuntimeError('World event rules changed during inference')
         if event:
             mutations=[EngineMutation.model_validate(m) for m in event.get('mutations',[])]
             if event.get('once',True):

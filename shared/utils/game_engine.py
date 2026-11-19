@@ -12,7 +12,7 @@ class GameEngine:
     async def get_state(self, conversation_id: int) -> dict:
         """Retrieves and normalizes the active game state matrix."""
         query = """
-            SELECT gs.inventory, gs.relationships, gs.quest_flags, c.current_place, c."current_time",c.state_version
+            SELECT gs.inventory, gs.relationships, gs.quest_flags, gs.runtime, c.current_place, c."current_time",c.state_version
             FROM conversations c
             LEFT JOIN game_states gs ON c.id = gs.conversation_id
             WHERE c.id = %s
@@ -25,6 +25,7 @@ class GameEngine:
 
         return {
             "state_version": row['state_version'],
+            "runtime": row.get('runtime') or {'executed_rules':[],'quest_progress':{},'characters':{},'clock_minutes':0},
             "inventory": row.get("inventory") or [],
             "relationships": row.get("relationships") or {},
             "quest_flags": row.get("quest_flags") or [],
@@ -38,6 +39,16 @@ class GameEngine:
             return
 
         current_state = copy.deepcopy(current_state)
+        from shared.utils.playthroughs import scene_for
+        scene=await scene_for(conversation_id)
+        rules=scene.get('rules',{})
+        runtime=current_state.setdefault('runtime',{})
+        runtime.setdefault('executed_rules',[])
+        runtime['executed_rules']=sorted(set(runtime['executed_rules']) | {f for f in current_state['quest_flags'] if f.startswith(('rule:','world:'))})
+        current_state['quest_flags']=[f for f in current_state['quest_flags'] if not f.startswith(('rule:','world:'))]
+        runtime.setdefault('quest_progress',{})
+        runtime.setdefault('characters',{})
+        runtime.setdefault('clock_minutes',0)
         # Turn list into dictionary mapping to handle additions/deletions cleanly
         inventory = {item["id"]: item for item in current_state["inventory"]}
         relationships = current_state["relationships"]
@@ -46,12 +57,20 @@ class GameEngine:
         new_time = current_state["time"]
 
         for mutation in evaluation.mutations:
-            if mutation.type == MutationType.ITEM_ADDED:
-                item_id = mutation.target.lower().replace(" ", "_")
+            if mutation.type == MutationType.CHARACTER_UPDATED:
+                from shared.schemas.playthrough import CharacterRuntime
+                if mutation.target not in {c['name'] for c in scene['cast']}:
+                    raise ValueError('Unknown character')
+                old=runtime['characters'].get(mutation.target,{})
+                updated=CharacterRuntime.model_validate(mutation.character_state or {}).model_dump()
+                runtime['characters'][mutation.target]={**old,**updated}
+            elif mutation.type == MutationType.ITEM_ADDED:
+                item_id = next((i['id'] for i in inventory.values() if i['id']==mutation.target or i['name']==mutation.target),mutation.target.lower().replace(" ", "_"))
                 if item_id in inventory:
                     inventory[item_id]["quantity"] += (mutation.value_change or 1)
                 else:
-                    inventory[item_id] = {
+                    catalog=rules.get('items',{}).get(item_id)
+                    inventory[item_id] = {**catalog,'quantity':mutation.value_change or 1} if catalog else {
                         "id": item_id,
                         "name": mutation.target,
                         "description": mutation.description,
@@ -59,7 +78,7 @@ class GameEngine:
                     }
 
             elif mutation.type == MutationType.ITEM_REMOVED:
-                item_id = mutation.target.lower().replace(" ", "_")
+                item_id = next((i['id'] for i in inventory.values() if i['id']==mutation.target or i['name']==mutation.target),mutation.target.lower().replace(" ", "_"))
                 if item_id not in inventory or inventory[item_id]["quantity"] < (mutation.value_change or 1):
                     raise ValueError("Insufficient inventory quantity")
                 if item_id in inventory:
@@ -69,15 +88,63 @@ class GameEngine:
 
             elif mutation.type == MutationType.AFFINITY_CHANGED:
                 char = mutation.target
+                # Repeating the same action does not farm affinity across turns.
+                import hashlib
+                from shared.utils.turns import job_claim
+                claim=job_claim.get()
+                turn=await fetch_one('SELECT content FROM turns WHERE id=%s',(claim.turn_id,)) if claim else None
+                fingerprint=hashlib.sha256(' '.join(turn['content'].casefold().split()).encode()).hexdigest() if turn else None
+                npc=runtime['characters'].setdefault(char,{})
+                seen=npc.setdefault('affinity_actions',[])
+                if fingerprint and fingerprint in seen:
+                    continue
+                if fingerprint:
+                    seen.append(fingerprint)
+                    del seen[:-100]
                 score_change = mutation.value_change or 0
                 if char not in relationships:
                     relationships[char] = {"character_name": char, "affinity_score": 0, "relationship_status": "Stranger"}
 
                 new_score = max(-100, min(100, relationships[char]["affinity_score"] + score_change))
                 relationships[char]["affinity_score"] = new_score
+                thresholds=rules.get('relationship_thresholds',{'Rival':-50,'Stranger':-10,'Acquaintance':10,'Friend':40,'Ally':75})
+                eligible=[(score,label) for label,score in thresholds.items() if new_score>=score]
+                relationships[char]['relationship_status']=max(eligible)[1] if eligible else 'Hostile'
 
             elif mutation.type == MutationType.FLAG_TRIGGERED:
-                quest_flags.add(mutation.target)
+                if mutation.target.startswith(('rule:','world:')):
+                    if mutation.target not in runtime['executed_rules']:
+                        runtime['executed_rules'].append(mutation.target)
+                else:
+                    quest_flags.add(mutation.target)
+            elif mutation.type == MutationType.FLAG_CLEARED:
+                quest_flags.discard(mutation.target)
+            elif mutation.type == MutationType.QUEST_ADVANCED:
+                stages=rules.get('quests',{}).get(mutation.target,[])
+                progress=runtime['quest_progress'].get(mutation.target,{'step':-1})
+                step=progress['step']+1
+                if not stages or step>=len(stages):
+                    raise ValueError('Invalid quest progression')
+                runtime['quest_progress'][mutation.target]={**progress,'step':step,'stage':stages[step],'status':'completed' if step==len(stages)-1 else 'active'}
+            elif mutation.type == MutationType.QUEST_FAILED:
+                if mutation.target not in rules.get('quests',{}) and mutation.target not in rules.get('quest_objectives',{}):
+                    raise ValueError('Unknown quest')
+                progress=runtime['quest_progress'].setdefault(mutation.target,{})
+                progress.update(status='failed',reason=mutation.description)
+            elif mutation.type == MutationType.QUEST_PROGRESS:
+                quest,separator,objective=mutation.target.partition(':')
+                definitions=rules.get('quest_objectives',{}).get(quest,{})
+                if not separator or objective not in definitions or not 1<=(mutation.value_change or 0)<=10000:
+                    raise ValueError('Unknown objective or invalid progress increment')
+                progress=runtime['quest_progress'].setdefault(quest,{'status':'active','objectives':{}})
+                counts=progress.setdefault('objectives',{})
+                counts[objective]=min(definitions[objective],counts.get(objective,0)+mutation.value_change)
+                progress['status']='completed' if all(counts.get(k,0)>=n for k,n in definitions.items()) else 'active'
+            elif mutation.type == MutationType.CLOCK_ADVANCED:
+                minutes=mutation.value_change or 0
+                if not 1<=minutes<=1440:
+                    raise ValueError('Story clock advance must be 1-1440 minutes')
+                runtime['clock_minutes']+=minutes
 
             elif mutation.type == MutationType.LOCATION_CHANGED:
                 new_place = mutation.target
@@ -99,18 +166,19 @@ class GameEngine:
             # Note the explicit inline conversions (%s::jsonb, %s::text[]) inside the SQL string!
             # This prevents type mismatch crashes when drivers process stringified elements.
             upsert_query = """
-                INSERT INTO game_states (conversation_id, inventory, relationships, quest_flags)
-                VALUES (%s, %s::jsonb, %s::jsonb, %s::text[])
+                INSERT INTO game_states (conversation_id, inventory, relationships, quest_flags,runtime)
+                VALUES (%s, %s::jsonb, %s::jsonb, %s::text[],%s::jsonb)
                 ON CONFLICT (conversation_id) DO UPDATE
                 SET inventory = EXCLUDED.inventory,
                     relationships = EXCLUDED.relationships,
-                    quest_flags = EXCLUDED.quest_flags
+                    quest_flags = EXCLUDED.quest_flags, runtime=EXCLUDED.runtime,updated_at=now()
             """
             upsert_params = (
                 conversation_id,
                 json.dumps(list(inventory.values())),
                 json.dumps(relationships),
                 list(quest_flags)
+                ,json.dumps(runtime)
             )
 
             await execute(upsert_query, upsert_params)
@@ -119,17 +187,26 @@ class GameEngine:
             claim = job_claim.get()
             if claim:
                 await execute('UPDATE turns SET state_version=state_version+1 WHERE id=%s',(claim.turn_id,))
+            from shared.schemas.playthrough import InitialState
+            InitialState.model_validate({'inventory':list(inventory.values()),'relationships':relationships,'quest_flags':list(quest_flags)})
+            snapshot={'inventory':list(inventory.values()),'relationships':relationships,'quest_flags':sorted(quest_flags),'runtime':runtime,'place':new_place,'time':new_time,'state_version':version['state_version']+1}
+            import uuid
+            operation=(claim.id+':'+str(claim.fence)) if claim else str(uuid.uuid4())
+            await execute('INSERT INTO state_events(conversation_id,turn_id,operation_id,state_version,snapshot,changes) VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb)',(conversation_id,claim.turn_id if claim else None,operation,snapshot['state_version'],json.dumps(snapshot),json.dumps([m.model_dump() for m in evaluation.mutations])))
 
         # 3. Broadcast execution state details via NATS stream pipeline channel
         ui_package = {
             "event": "engine_state_updated",
             "conversation_id": conversation_id,
             "mutations": [m.model_dump() for m in evaluation.mutations],
+            "state_version": snapshot['state_version'],
             "current_state": {
                 "place": new_place,
                 "time": new_time,
                 "inventory": list(inventory.values()),
-                "relationships": relationships
+                "relationships": relationships,
+                "quest_flags":sorted(quest_flags),"runtime":runtime,
+                "state_version":snapshot['state_version']
             }
         }
         await self.nats.publish(f"roleplay.chat.stream.{conversation_id}", json.dumps(ui_package).encode())

@@ -62,6 +62,11 @@ async def complete_job(payload=None, blocked=None):
         await execute("UPDATE jobs SET status='completed',result=%s::jsonb,completed_at=now(),owner=NULL,lease_until=NULL WHERE id=%s", (json.dumps(payload or {}),claim.id))
         next_stage = {'validate':'actor', 'actor':'director'}.get(claim.stage)
         status = 'blocked' if blocked else {'validate':'generating','actor':'narrating','director':'completed'}[claim.stage]
+        job=await fetch_one('SELECT payload FROM jobs WHERE id=%s',(claim.id,))
+        regenerated=claim.stage=='actor' and job['payload'].get('regenerate',False)
+        if regenerated:
+            next_stage=None
+            status='completed'
         if claim.stage=='validate':
             await execute("UPDATE messages SET metadata=COALESCE(metadata,'{}'::jsonb)||%s::jsonb WHERE id=%s",(json.dumps({'action_status':'blocked' if blocked else 'accepted','failure_reason':blocked}),row['user_message_id']))
         await execute('UPDATE turns SET status=%s,failure=%s,updated_at=now() WHERE id=%s', (status,blocked,claim.turn_id))
@@ -69,7 +74,7 @@ async def complete_job(payload=None, blocked=None):
             data = {'conversation_id':row['conversation_id'],'user_id':row['user_id'],'content':row['content'],
                     'message_id':row['user_message_id'],'event_id':str(row['id']),**(payload or {})}
             await enqueue(claim.turn_id,next_stage,data)
-        if blocked or claim.stage=='director':
+        if blocked or claim.stage=='director' or regenerated:
             packet = {'event':'action_blocked' if blocked else 'director_state_change','conversation_id':row['conversation_id'],
                       'turn_id':claim.turn_id,'payload':{'reason':blocked} if blocked else {'state':'completed','message':'Turn completed'}}
             await execute('INSERT INTO event_outbox(subject,payload) VALUES (%s,%s)', ('roleplay.chat.stream.'+str(row['conversation_id']),json.dumps(packet).encode()))

@@ -8,6 +8,8 @@ from shared.db.migrate import check_schema
 from shared.db.postgres import close_pool
 
 async def main():
+    from shared.utils.observability import setup_telemetry,flush_telemetry
+    setup_telemetry('outbox')
     from shared.utils.runtime import install_shutdown_handlers
     restore=install_shutdown_handlers()
     await check_schema()
@@ -20,7 +22,7 @@ async def main():
         while True:
             await recover_jobs()
             await asyncio.sleep(5)
-    tasks = [asyncio.create_task(publisher.relay_outbox()),asyncio.create_task(recover())]
+    tasks = [asyncio.create_task(publisher.relay_outbox()),asyncio.create_task(recover()),asyncio.create_task(flush_telemetry())]
     try:
         await asyncio.gather(*tasks)
     finally:

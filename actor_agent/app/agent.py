@@ -67,6 +67,10 @@ def _build_system_prompt(
             lines.append(f"Role: {user_char['role_description']}")
         if user_char.get("personality"):
             lines.append(f"Personality: {user_char['personality']}")
+        if user_char.get('background'):
+            lines.append(f"Player background: {user_char['background']}")
+        if user_char.get('appearance'):
+            lines.append(f"Player appearance: {user_char['appearance']}")
         if user_char.get("likes"):
             likes_data = user_char["likes"]
             likes_str = ", ".join(likes_data) if isinstance(likes_data, list) else str(likes_data)
@@ -95,10 +99,12 @@ def _build_system_prompt(
         "   - Use single asterisks for physical actions, gestures, sensory details, and internal thoughts.",
         "   - Write spoken dialogue in plain, regular text without asterisks.",
         "3. Pacing & Length Control:",
-        "   - Keep your responses concise and impactful—typically 1 to 3 short paragraphs.",
+        "   - Follow the resolved writing preferences supplied below for length, perspective, language, and formatting.",
         "   - NEVER monologue endlessly. Always leave room for the user to react.",
         "   - Ensure your response ends on a completed sentence or action. Never stop mid-thought.",
-        "4. Agency: Play ONLY your character. Never describe the user's thoughts, feelings, or dialogue for them."
+        "4. Agency: Play ONLY your character. Never describe the user's thoughts, feelings, or dialogue for them.",
+        "5. Continuity: Do not invent a past acquisition, gift, promise, or relationship milestone. An item being present does not establish who gave it to the player. Use supplied sources; admit when past details or private conversations are unknown.",
+        "6. Story time: Absence from this application does not advance the story clock."
     ])
     
     return "\n".join(lines)
@@ -213,22 +219,19 @@ class ActorAgent:
                 logger.error("Aborting generation loop: Conversation ID %s not registered in DB.", conversation_id)
                 return
 
-            # Execute concurrent tasks for character configuration profiles
-            ai_char_task = fetch_one("SELECT * FROM characters WHERE id = %s", (conv["ai_character_id"],))
-            user_char_task = (
-                fetch_one("SELECT * FROM characters WHERE id = %s", (conv["user_character_id"],))
-                if conv["user_character_id"] else asyncio.sleep(0, result=None)
-            )
-            
-            ai_char, user_char = await asyncio.gather(ai_char_task, user_char_task)
+            from shared.utils.playthroughs import scene_for,effective_preferences
+            definition=await scene_for(conversation_id)
+            conv.update({k:definition.get(k) for k in ('title','introduction')})
+            ai_char=next((c for c in definition['cast'] if c['id']==conv['ai_character_id']),None)
+            saved=await fetch_one('SELECT persona,preferences,user_id FROM conversations WHERE id=%s',(conversation_id,))
+            user_char=saved['persona'] or next((c for c in definition['cast'] if c['id']==conv['user_character_id']),None)
+            preferences=await effective_preferences(saved['user_id'],saved['preferences'],definition.get('rules',{}).get('writing_defaults',{}))
             if not ai_char:
-                logger.error("Base processing error: Target AI character data sheet is blank.")
-                return
-
+                raise ValueError('Character missing from pinned scenario version')
             # Retrieve conversational context history window
             recent_messages = await fetch_all(
                 """SELECT sender, content FROM messages
-                   WHERE conversation_id = %s AND COALESCE(metadata->>'action_status','accepted') NOT IN ('blocked','pending')
+                   WHERE conversation_id = %s AND NOT superseded AND id NOT IN (SELECT source_message_id FROM memory_facts WHERE conversation_id=messages.conversation_id AND (suppressed OR manual OR known_by IS NOT NULL)) AND COALESCE(metadata->>'action_status','accepted') NOT IN ('blocked','pending')
                    ORDER BY id DESC LIMIT 10
                 """,
                 (conversation_id,),
@@ -242,7 +245,7 @@ class ActorAgent:
             if search_text:
                 try:
                     from shared.utils.retrieval import retrieve
-                    memories = await retrieve(search_text,conversation_id,conv['scenario_id'],user_id)
+                    memories = await retrieve(search_text,conversation_id,conv['scenario_id'],user_id,ai_char['name'])
                 except Exception as e:
                     logger.warning("Context retrieval subsystem caught a non-breaking error: %s", e)
 
@@ -258,10 +261,20 @@ class ActorAgent:
 
             from shared.utils.game_engine import GameEngine
             state = await GameEngine(self.nats_publisher).get_state(conversation_id)
-            system_prompt += '\nAuthoritative mechanical state: ' + json.dumps(state)
+            import copy
+            actor_state=copy.deepcopy(state)
+            actor_state['runtime']['characters']={ai_char['name']:actor_state['runtime'].get('characters',{}).get(ai_char['name'],{})}
+            actor_state['runtime']['characters'][ai_char['name']].pop('affinity_actions',None)
+            system_prompt += '\nAuthoritative mechanical state and your private knowledge: ' + json.dumps(actor_state)
             for field in ('appearance', 'likes', 'dislikes', 'scenario'):
                 if ai_char.get(field):
                     system_prompt += '\n' + field + ': ' + str(ai_char[field])
+            system_prompt += '\nResolved writing preferences: '+json.dumps(preferences)
+            lengths={'short':'one short paragraph, at most three sentences','medium':'two or three short paragraphs','long':'four to six paragraphs'}
+            system_prompt += '\nWrite in '+preferences['language']+'. Use '+preferences['perspective']+' person for action narration; dialogue may naturally use first person. Target '+lengths[preferences['response_length']]+'. '
+            if preferences['formatting']=='plain':
+                system_prompt+='Use plain text without asterisk action formatting.'
+
             messages = [{"role": "system", "content": system_prompt}]
             for m in recent_messages:
                 role = "user" if m["sender"] == "user" else "assistant"
@@ -269,7 +282,7 @@ class ActorAgent:
 
             # A durable input ID fences context to the triggering turn.
             if data.get("message_id"):
-                recent_messages = await fetch_all("SELECT sender, content FROM messages WHERE conversation_id=%s AND id<=%s AND COALESCE(metadata->>'action_status','accepted') NOT IN ('blocked','pending') ORDER BY id DESC LIMIT 10", (conversation_id, data["message_id"]))
+                recent_messages = await fetch_all("SELECT sender, content FROM messages WHERE conversation_id=%s AND id<=%s AND NOT superseded AND id NOT IN (SELECT source_message_id FROM memory_facts WHERE conversation_id=messages.conversation_id AND (suppressed OR manual OR known_by IS NOT NULL)) AND COALESCE(metadata->>'action_status','accepted') NOT IN ('blocked','pending') ORDER BY id DESC LIMIT 10", (conversation_id, data["message_id"]))
                 recent_messages.reverse()
                 messages = [{"role": "system", "content": system_prompt}]
                 messages.extend({"role": "user" if m["sender"] == "user" else "assistant", "content": m["content"]} for m in recent_messages)
@@ -295,8 +308,7 @@ class ActorAgent:
                 raise RuntimeError('Provider returned an empty reply')
 
             # PIPELINE STATE 4: Hand off final text payload out-of-band to Chronicler Agent
-            # We don't perform SQL block inserts here. We broadcast the finished log event to NATS JetStream
-            # and immediately return back to standby, keeping the worker unblocked.
+            # Persist the reply and next-stage scheduling in one fenced transaction.
             chronicler_payload = {
                 "event_id": "actor-" + str(data.get("event_id") or uuid.uuid4()),
                 "turn_id": data.get("turn_id"),

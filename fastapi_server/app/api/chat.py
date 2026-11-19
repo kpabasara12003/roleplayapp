@@ -21,10 +21,7 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 nats_publisher = NATSPublisher()
 
-class ChatStartRequest(BaseModel):
-    scenario_id: int
-    ai_character_id: int
-    user_character_id: Optional[int] = None
+from fastapi_server.app.api.playthroughs import Start as ChatStartRequest
 
 class ChatMessageRequest(BaseModel):
     conversation_id: int
@@ -56,58 +53,8 @@ async def start_conversation(
     payload: ChatStartRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Create a new conversation for a scenario."""
-    scenario = await fetch_one(
-        "SELECT id, place, time FROM scenarios WHERE id = %s AND user_id = %s",
-        (payload.scenario_id, user["id"]),
-    )
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
-
-    ai_char = await fetch_one(
-        "SELECT id FROM characters WHERE id = %s AND scenario_id = %s AND is_ai = true",
-        (payload.ai_character_id, payload.scenario_id),
-    )
-    if not ai_char:
-        raise HTTPException(status_code=404, detail="AI character not found in scenario")
-
-    if payload.user_character_id:
-        uc = await fetch_one(
-            "SELECT id FROM characters WHERE id = %s AND scenario_id = %s AND is_ai = false",
-            (payload.user_character_id, payload.scenario_id),
-        )
-        if not uc:
-            raise HTTPException(status_code=404, detail="User character not found in scenario")
-
-    conv = await execute_returning(
-        """
-        INSERT INTO conversations (scenario_id, user_id, ai_character_id, user_character_id, current_place, "current_time", status)
-        VALUES (%s, %s, %s, %s, %s, %s, 'active')
-        RETURNING id, scenario_id, user_id, ai_character_id, user_character_id, current_place, "current_time", status, created_at, updated_at
-        """,
-        (
-            payload.scenario_id,
-            user["id"],
-            payload.ai_character_id,
-            payload.user_character_id,
-            scenario["place"] or "Unknown",
-            scenario["time"] or "Unknown",
-        ),
-    )
-
-    ai_char_data = await fetch_one("SELECT greeting FROM characters WHERE id = %s", (payload.ai_character_id,))
-    greeting = ai_char_data.get("greeting") if ai_char_data else None
-    if greeting:
-        await execute_returning(
-            """
-            INSERT INTO messages (conversation_id, sender, content, metadata)
-            VALUES (%s, 'ai', %s, %s)
-            RETURNING id
-            """,
-            (conv["id"], greeting, json.dumps({"type": "greeting"})),
-        )
-
-    return conv
+    from fastapi_server.app.api.playthroughs import start
+    return await start(payload,user)
 
 
 @router.post("/send", response_model=ChatMessageResponse)
@@ -175,7 +122,7 @@ async def get_history(conversation_id: int, user: dict = Depends(get_current_use
         raise HTTPException(status_code=404, detail="Conversation not found")
     return await fetch_all(
         """SELECT id, conversation_id, sender, content, created_at
-           FROM (SELECT * FROM messages WHERE conversation_id = %s AND (%s::int IS NULL OR id < %s) ORDER BY id DESC LIMIT %s) recent ORDER BY id ASC""",
+           FROM (SELECT * FROM messages WHERE conversation_id = %s AND NOT superseded AND (%s::int IS NULL OR id < %s) ORDER BY id DESC LIMIT %s) recent ORDER BY id ASC""",
         (conversation_id, before_id, before_id, limit),
     )
 

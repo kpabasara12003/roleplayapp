@@ -3,9 +3,11 @@ from datetime import datetime
 from pydantic import BaseModel
 from pydantic import Field
 from shared.schemas.rules import ScenarioRules
+from shared.schemas.playthrough import InitialState
 
 
 class ScenarioBase(BaseModel):
+    initial_state: InitialState = Field(default_factory=InitialState)
     title: str
     greeting: Optional[str] = None
     place: Optional[str] = None
@@ -20,6 +22,7 @@ class ScenarioCreate(ScenarioBase):
 
 
 class ScenarioUpdate(BaseModel):
+    initial_state: Optional[InitialState] = None
     rules: Optional[ScenarioRules] = None
     title: Optional[str] = None
     greeting: Optional[str] = None

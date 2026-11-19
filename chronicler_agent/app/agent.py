@@ -4,8 +4,6 @@ import json
 import uuid  
 import asyncio
 import selectors
-from collections import defaultdict
-from typing import Dict
 from datetime import datetime, timezone
 
 from shared.utils.nats_client import NATSPublisher
@@ -18,9 +16,6 @@ from shared.utils.logger import get_logger
 from chronicler_agent.app.config import settings
 
 logger = get_logger(__name__)
-
-# Track historical message metrics locally to isolate memory indexing operations
-_message_counts: Dict[int, int] = defaultdict(int)
 
 # A single unprocessable message must never be redelivered forever: that stalls this
 # single-consumer loop and floods PostgreSQL / the log with the same failure.
@@ -219,7 +214,7 @@ class ChroniclerAgent:
             return 1
 
     async def index_memories(self):
-        from shared.utils.memory_index import index_lore,reconcile_vectors
+        from shared.utils.memory_index import index_lore,index_versions,reconcile_vectors
         iteration=0
         while True:
             try:
@@ -230,6 +225,7 @@ class ChroniclerAgent:
                     except Exception:
                         logger.exception('Memory block failed; checkpoint preserved for retry')
                 await index_lore()
+                await index_versions()
                 if iteration%6==0:
                     await reconcile_vectors()
                 iteration+=1

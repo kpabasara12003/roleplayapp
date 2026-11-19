@@ -10,12 +10,13 @@ def authorize(evaluation, action, state, rules, cast):
         return evaluation
     approved = []
     inventory = {item['id']:item['quantity'] for item in state.get('inventory',[])}
-    flags = set(state.get('quest_flags',[]))
+    flags = set(state.get('quest_flags',[])) | set(state.get('runtime',{}).get('executed_rules',[]))
     for transition in rules.get('transitions',[]):
-        if not any(trigger.casefold() in action.casefold() for trigger in transition.get('triggers',[]) if trigger.strip()):
+        # Explicit command IDs come from structured inference, never substring matching.
+        if transition['id'] not in evaluation.command_ids:
             continue
         marker = 'rule:' + transition['id']
-        if transition.get('once', True) and marker in flags:
+        if transition.get('once', True) and marker in set(state.get('runtime',{}).get('executed_rules',[])) | flags:
             continue
         if any(inventory.get(key,0)<qty for key,qty in transition.get('requires_items',{}).items()):
             raise RuleViolation('This action requires items you do not possess')
@@ -25,6 +26,9 @@ def authorize(evaluation, action, state, rules, cast):
         if transition.get('once',True):
             approved.append(EngineMutation(type=MutationType.FLAG_TRIGGERED,target=marker,description='Scenario transition completed'))
     # The model may suggest small relationship reactions, but cannot invent cast members.
+    unknown=set(evaluation.command_ids)-{t['id'] for t in rules.get('transitions',[])}
+    if unknown:
+        raise RuleViolation('Unknown action command')
     affinity={}
     for mutation in evaluation.mutations:
         if mutation.type == MutationType.AFFINITY_CHANGED:

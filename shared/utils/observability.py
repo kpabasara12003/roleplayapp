@@ -40,7 +40,11 @@ def setup_telemetry(service):
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader,ConsoleMetricExporter
     metric_file=RotatingOutput(directory/f'{service}-{os.getpid()}.metrics.log')
-    metrics.set_meter_provider(MeterProvider(resource=Resource.create({'service.name':service}),metric_readers=[PeriodicExportingMetricReader(ConsoleMetricExporter(out=metric_file),export_interval_millis=10000)]))
+    readers=[PeriodicExportingMetricReader(ConsoleMetricExporter(out=metric_file),export_interval_millis=10000)]
+    if endpoint:
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+        readers.append(PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=endpoint.rstrip('/')+'/v1/metrics'),export_interval_millis=10000))
+    metrics.set_meter_provider(MeterProvider(resource=Resource.create({'service.name':service}),metric_readers=readers))
     _configured = True
 
 def tracer():
