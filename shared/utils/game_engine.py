@@ -56,6 +56,20 @@ class GameEngine:
         new_place = current_state["place"]
         new_time = current_state["time"]
 
+        # Aggregate once per character before applying per-action repetition controls.
+        totals={}
+        for mutation in evaluation.mutations:
+            if mutation.type==MutationType.AFFINITY_CHANGED:
+                totals[mutation.target]=totals.get(mutation.target,0)+(mutation.value_change or 0)
+        mutations=[]
+        emitted=set()
+        for mutation in evaluation.mutations:
+            if mutation.type==MutationType.AFFINITY_CHANGED:
+                if mutation.target in emitted or not totals[mutation.target]:continue
+                emitted.add(mutation.target)
+                mutation=mutation.model_copy(update={'value_change':totals[mutation.target]})
+            mutations.append(mutation)
+        evaluation=evaluation.model_copy(update={'mutations':mutations})
         for mutation in evaluation.mutations:
             if mutation.type == MutationType.CHARACTER_UPDATED:
                 from shared.schemas.playthrough import CharacterRuntime
@@ -119,27 +133,9 @@ class GameEngine:
                     quest_flags.add(mutation.target)
             elif mutation.type == MutationType.FLAG_CLEARED:
                 quest_flags.discard(mutation.target)
-            elif mutation.type == MutationType.QUEST_ADVANCED:
-                stages=rules.get('quests',{}).get(mutation.target,[])
-                progress=runtime['quest_progress'].get(mutation.target,{'step':-1})
-                step=progress['step']+1
-                if not stages or step>=len(stages):
-                    raise ValueError('Invalid quest progression')
-                runtime['quest_progress'][mutation.target]={**progress,'step':step,'stage':stages[step],'status':'completed' if step==len(stages)-1 else 'active'}
-            elif mutation.type == MutationType.QUEST_FAILED:
-                if mutation.target not in rules.get('quests',{}) and mutation.target not in rules.get('quest_objectives',{}):
-                    raise ValueError('Unknown quest')
-                progress=runtime['quest_progress'].setdefault(mutation.target,{})
-                progress.update(status='failed',reason=mutation.description)
-            elif mutation.type == MutationType.QUEST_PROGRESS:
-                quest,separator,objective=mutation.target.partition(':')
-                definitions=rules.get('quest_objectives',{}).get(quest,{})
-                if not separator or objective not in definitions or not 1<=(mutation.value_change or 0)<=10000:
-                    raise ValueError('Unknown objective or invalid progress increment')
-                progress=runtime['quest_progress'].setdefault(quest,{'status':'active','objectives':{}})
-                counts=progress.setdefault('objectives',{})
-                counts[objective]=min(definitions[objective],counts.get(objective,0)+mutation.value_change)
-                progress['status']='completed' if all(counts.get(k,0)>=n for k,n in definitions.items()) else 'active'
+            elif mutation.type in (MutationType.QUEST_STARTED,MutationType.QUEST_RESTARTED,MutationType.QUEST_ADVANCED,MutationType.QUEST_PROGRESS,MutationType.QUEST_FAILED):
+                from shared.utils.quests import apply_quest
+                apply_quest(runtime['quest_progress'],rules,mutation)
             elif mutation.type == MutationType.CLOCK_ADVANCED:
                 minutes=mutation.value_change or 0
                 if not 1<=minutes<=1440:

@@ -36,14 +36,17 @@ async def _serve() -> None:
 
 def main() -> None:
     logger.info("Starting FastAPI gateway on port %s", settings.api_port)
-    if sys.platform == "win32":
-        # psycopg async only supports a SelectorEventLoop on Windows.
-        asyncio.run(
-            _serve(),
-            loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
-        )
-    else:
-        asyncio.run(_serve())
+    try:
+        if sys.platform == "win32":
+            # psycopg async only supports a SelectorEventLoop on Windows.
+            asyncio.run(
+                _serve(),
+                loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
+            )
+        else:
+            asyncio.run(_serve())
+    except KeyboardInterrupt:
+        logger.info("Gateway interrupted by user; shutdown complete.")
 
 
 if __name__ == "__main__":

@@ -63,6 +63,11 @@ async def fork_at(cid,payload,user,omit_reply=False):
         if payload.turn_id and not turn: raise HTTPException(404,'Completed turn not found')
         version=turn['state_version'] if turn else 0
         event=await fetch_one('SELECT snapshot FROM state_events WHERE conversation_id=%s AND state_version<=%s ORDER BY state_version DESC LIMIT 1',(cid,version))
+        if turn:
+            checkpoint=await fetch_one('SELECT snapshot FROM turn_checkpoints WHERE turn_id=%s AND phase=%s',(turn['id'],'before_reply' if omit_reply else 'after_turn'))
+            if omit_reply and not checkpoint:
+                raise HTTPException(409,'No reliable before-reply checkpoint exists for this historic turn')
+            event=checkpoint or event
         if not event: raise HTTPException(409,'No checkpoint for this turn; play a turn before branching')
         greeting=await fetch_one("SELECT max(id) AS id FROM messages WHERE conversation_id=%s AND metadata->>'type'='greeting'",(cid,))
         cutoff=turn['user_message_id'] if turn else (greeting['id'] or 0)
@@ -99,6 +104,8 @@ async def regenerate(cid:int,payload:Fork,user:dict=Depends(get_current_user)):
         msg=await fetch_one("SELECT id FROM messages WHERE conversation_id=%s AND sender='user' ORDER BY id DESC LIMIT 1",(new['id'],))
         turn_id=uuid.uuid4()
         await execute("INSERT INTO turns(id,conversation_id,request_id,user_message_id,content,user_id,status,state_version) VALUES (%s,%s,%s,%s,%s,%s,'generating',0)",(turn_id,new['id'],uuid.uuid4(),msg['id'],old['content'],user['id']))
+        from shared.utils.game_engine import GameEngine
+        await execute("INSERT INTO turn_checkpoints(turn_id,phase,snapshot) VALUES (%s,'before_reply',%s::jsonb)",(turn_id,json.dumps(await GameEngine(None).get_state(new['id']))))
         from shared.utils.turns import enqueue
         await enqueue(turn_id,'actor',{'turn_id':str(turn_id),'event_id':str(turn_id),'conversation_id':new['id'],'user_id':user['id'],'message_id':msg['id'],'content':old['content'],'regenerate':True})
         return {'conversation':new,'turn_id':turn_id}

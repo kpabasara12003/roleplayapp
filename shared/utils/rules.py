@@ -40,6 +40,14 @@ def authorize(evaluation, action, state, rules, cast):
                 raise RuleViolation('Total relationship change exceeds the per-turn limit')
         elif not any(mutation.type==m.type and mutation.target==m.target and mutation.value_change==m.value_change for m in approved):
             raise RuleViolation('The proposed world change is not authorized by scenario rules')
+    from shared.utils.quests import apply_quest
+    progress=copy.deepcopy(state.get('runtime',{}).get('quest_progress',{}))
+    try:
+        for mutation in approved:
+            if mutation.type in (MutationType.QUEST_STARTED,MutationType.QUEST_RESTARTED,MutationType.QUEST_ADVANCED,MutationType.QUEST_PROGRESS,MutationType.QUEST_FAILED):
+                apply_quest(progress,rules,mutation)
+    except ValueError as exc:
+        raise RuleViolation(str(exc)) from exc
     return evaluation.model_copy(update={'mutations':approved})
 
 def world_event(event_id, rules):

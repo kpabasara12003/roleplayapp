@@ -15,6 +15,8 @@ class CharacterAffinity(BaseModel):
     relationship_status: str = "Stranger"       # Friendly, Suspicious, Rival, Ally
 
 class MutationType(str, Enum):
+    QUEST_STARTED = 'QUEST_STARTED'
+    QUEST_RESTARTED = 'QUEST_RESTARTED'
     QUEST_FAILED = 'QUEST_FAILED'
     QUEST_PROGRESS = 'QUEST_PROGRESS'
     CHARACTER_UPDATED = 'CHARACTER_UPDATED'

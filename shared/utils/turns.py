@@ -67,6 +67,11 @@ async def complete_job(payload=None, blocked=None):
         if regenerated:
             next_stage=None
             status='completed'
+        phase='before_reply' if claim.stage=='validate' and not blocked else 'after_turn' if status=='completed' else None
+        if phase:
+            from shared.utils.game_engine import GameEngine
+            snapshot=await GameEngine(None).get_state(row['conversation_id'])
+            await execute('INSERT INTO turn_checkpoints(turn_id,phase,snapshot) VALUES (%s,%s,%s::jsonb) ON CONFLICT DO NOTHING',(claim.turn_id,phase,json.dumps(snapshot)))
         if claim.stage=='validate':
             await execute("UPDATE messages SET metadata=COALESCE(metadata,'{}'::jsonb)||%s::jsonb WHERE id=%s",(json.dumps({'action_status':'blocked' if blocked else 'accepted','failure_reason':blocked}),row['user_message_id']))
         await execute('UPDATE turns SET status=%s,failure=%s,updated_at=now() WHERE id=%s', (status,blocked,claim.turn_id))
