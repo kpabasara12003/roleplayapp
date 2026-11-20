@@ -61,11 +61,14 @@ async def start(payload,user):
 
 @router.post('/scenarios/{sid}/publish')
 async def publish(sid:int,user:dict=Depends(get_current_user)):
-    scene=await fetch_one('SELECT id FROM scenarios WHERE id=%s AND user_id=%s AND deleted_at IS NULL',(sid,user['id']))
-    if not scene: raise HTTPException(404,'Scenario not found')
-    version=await capture_version(sid,True)
-    await execute('UPDATE scenarios SET is_public=true WHERE id=%s',(sid,))
-    return version
+    async with transaction():
+        scene=await fetch_one('SELECT id FROM scenarios WHERE id=%s AND user_id=%s AND deleted_at IS NULL FOR UPDATE',(sid,user['id']))
+        if not scene: raise HTTPException(404,'Scenario not found')
+        playable=await fetch_one('SELECT id FROM characters WHERE scenario_id=%s AND is_ai=true LIMIT 1',(sid,))
+        if not playable: raise HTTPException(422,'Add at least one AI character before publishing')
+        version=await capture_version(sid,True)
+        await execute('UPDATE scenarios SET is_public=true WHERE id=%s',(sid,))
+        return version
 
 @router.get('/catalog/scenarios')
 async def catalog(limit:int=Query(30,ge=1,le=100),before:int|None=None,user:dict=Depends(get_current_user)):

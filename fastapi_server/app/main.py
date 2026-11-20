@@ -54,6 +54,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from fastapi_server.app.services.request_limits import RequestBodyLimit
+app.add_middleware(RequestBodyLimit)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

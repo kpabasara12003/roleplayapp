@@ -103,7 +103,7 @@ async def update_scenario(
     values.extend([scenario_id, user["id"]])
     sql = f"""
         UPDATE scenarios SET {', '.join(fields)}
-        WHERE id = %s AND user_id = %s
+        WHERE id = %s AND user_id = %s AND deleted_at IS NULL
         RETURNING id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
     """
     row = await execute_returning(sql, tuple(values))

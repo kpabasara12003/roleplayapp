@@ -1,16 +1,18 @@
 from fastapi import APIRouter,Depends,HTTPException
-from pydantic import BaseModel,Field
+from pydantic import BaseModel,Field,ConfigDict,StringConstraints
+from typing import Annotated
 from shared.db.postgres import fetch_one,fetch_all,execute_returning,execute,transaction
 from fastapi_server.app.api.users import get_current_user
 
 router=APIRouter(prefix='/scenarios',tags=['Lore'])
 class LoreEntry(BaseModel):
-    keyword: str=Field(min_length=1,max_length=50)
-    description: str=Field(min_length=1,max_length=12000)
+    model_config=ConfigDict(extra='forbid')
+    keyword: Annotated[str,StringConstraints(strip_whitespace=True,min_length=1,max_length=50)]
+    description: Annotated[str,StringConstraints(strip_whitespace=True,min_length=1,max_length=12000)]
     category: str|None=Field(default=None,max_length=50)
 
 async def owned(sid,user):
-    if not await fetch_one('SELECT id FROM scenarios WHERE id=%s AND user_id=%s',(sid,user['id'])):
+    if not await fetch_one('SELECT id FROM scenarios WHERE id=%s AND user_id=%s AND deleted_at IS NULL',(sid,user['id'])):
         raise HTTPException(status_code=404,detail='Scenario not found')
 
 @router.get('/{scenario_id}/lore')
