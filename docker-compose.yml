@@ -1,0 +1,73 @@
+services:
+  nats-jetstream:
+    image: nats:latest
+    container_name: nats-jetstream
+    command: ["-c", "/etc/nats/jetstream.conf"]
+    ports:
+      - "4222:4222"   # NATS client port
+      - "8222:8222"   # HTTP monitoring dashboard
+    volumes:
+      - ./config/nats/jetstream.conf:/etc/nats/jetstream.conf:ro
+      - nats_data:/data
+    networks:
+      - dev_net
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4318:4318"   # OTLP HTTP receiver
+      - "13133:13133" # Health check extension
+    volumes:
+      - ./config/otel/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      - dev_net
+    restart: unless-stopped
+
+  valkey-dev:
+    image: valkey/valkey:8-alpine
+    container_name: valkey-dev
+    command: ["valkey-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+    networks:
+      - dev_net
+    restart: unless-stopped
+
+  valkey-admin:
+    image: rediscommander/redis-commander:latest
+    container_name: valkey-admin
+    environment:
+      - REDIS_HOSTS=valkey-dev:valkey-dev:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - valkey-dev
+    networks:
+      - dev_net
+    restart: unless-stopped
+
+  qdrant-dev:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-dev
+    ports:
+      - "6333:6333"   # REST API & Web Dashboard
+      - "6334:6334"   # gRPC API
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - dev_net
+    restart: unless-stopped
+
+networks:
+  dev_net:
+    driver: bridge
+
+volumes:
+  nats_data:
+  valkey_data:
+  qdrant_storage:
