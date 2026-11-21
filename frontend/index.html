@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>fable. — A place to become</title>
+  <meta name="referrer" content="no-referrer" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http: https: ws: wss:; img-src 'none'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-src 'none'" />
+  <script src="src/theme.js?v=authoring-5"></script>
+  <link rel="stylesheet" href="styles/global.css" />
+  <link rel="stylesheet" href="styles/nav.css" />
+  <link rel="stylesheet" href="styles/chat.css" />
+  <link rel="stylesheet" href="styles/components.css" />
+  <link rel="stylesheet" href="styles/studio.css?v=authoring-5" />
+  <link rel="stylesheet" href="styles/authoring.css?v=authoring-5" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Local vendored React only; no third-party script execution. -->
+  <script src="vendor/react.production.min.js"></script>
+<script src="vendor/react-dom.production.min.js"></script>
+<!-- Core models / stores / API -->
+  <script src="src/validation.js?v=authoring-5"></script>
+  <script src="src/types.js?v=authoring-5"></script>
+  <script src="src/store/session.js?v=authoring-5"></script>
+  <script src="src/api/client.js?v=authoring-5"></script>
+  <script src="src/api/ws.js?v=authoring-5"></script>
+  <script src="src/store/conversationStore.js?v=authoring-5"></script>
+
+  <!-- Shared components (Modal must load before ConfirmDialog) -->
+  <script src="src/components/Modal.js?v=authoring-5"></script>
+  <script src="src/components/EmptyState.js?v=authoring-5"></script>
+  <script src="src/components/ErrorBanner.js?v=authoring-5"></script>
+  <script src="src/components/LoadingSpinner.js?v=authoring-5"></script>
+  <script src="src/components/Toast.js?v=authoring-5"></script>
+  <script src="src/components/ConfirmDialog.js?v=authoring-5"></script>
+
+  <!-- Screens -->
+  <script src="src/screens/AuthScreen.js?v=authoring-5"></script>
+  <script src="src/screens/Catalog.js?v=authoring-5"></script>
+  <script src="src/screens/ChatScreen.js?v=authoring-5"></script>
+  <script src="src/screens/MemoryScreen.js?v=authoring-5"></script>
+  <script src="src/screens/MyScenarios.js?v=authoring-5"></script>
+  <script src="src/screens/PersonasScreen.js?v=authoring-5"></script>
+  <script src="src/screens/Preferences.js?v=authoring-5"></script>
+  <script src="src/screens/SavedStories.js?v=authoring-5"></script>
+  <script src="src/screens/ScenarioEditor.js?v=authoring-5"></script>
+
+  <!-- App shell + mount -->
+  <script src="src/App.js?v=authoring-5"></script>
+  <script src="src/main.js?v=authoring-5"></script>
+</body>
+</html>

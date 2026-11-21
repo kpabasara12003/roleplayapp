@@ -15,7 +15,7 @@ async def create_character(
 ):
     # Verify scenario ownership
     scenario = await fetch_one(
-        "SELECT id FROM scenarios WHERE id = %s AND user_id = %s",
+        "SELECT id FROM scenarios WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
         (payload.scenario_id, user["id"]),
     )
     if not scenario:
@@ -66,7 +66,7 @@ async def list_characters(
                c.greeting, c.scenario, c.role_description, c.created_at, c.updated_at
         FROM characters c
         JOIN scenarios s ON c.scenario_id = s.id
-        WHERE s.user_id = %s AND c.scenario_id = %s
+        WHERE s.deleted_at IS NULL AND s.user_id = %s AND c.scenario_id = %s
     """
     params: list = [user["id"], scenario_id]
     if is_ai is not None:
@@ -89,7 +89,7 @@ async def get_character(
                c.greeting, c.scenario, c.role_description, c.created_at, c.updated_at
         FROM characters c
         JOIN scenarios s ON c.scenario_id = s.id
-        WHERE c.id = %s AND s.user_id = %s
+        WHERE s.deleted_at IS NULL AND c.id = %s AND s.user_id = %s
         """,
         (character_id, user["id"]),
     )
@@ -109,7 +109,7 @@ async def update_character(
         """
         SELECT c.id FROM characters c
         JOIN scenarios s ON c.scenario_id = s.id
-        WHERE c.id = %s AND s.user_id = %s
+        WHERE s.deleted_at IS NULL AND c.id = %s AND s.user_id = %s
         """,
         (character_id, user["id"]),
     )
@@ -123,7 +123,7 @@ async def update_character(
         "backstory", "example_dialogue", "appearance", "greeting", "scenario", "role_description",
     ]:
         val = getattr(payload, field_name)
-        if val is not None:
+        if field_name in payload.model_fields_set and (val is not None or field_name != 'name'):
             fields.append(f"{field_name} = %s")
             values.append(val)
 
@@ -152,7 +152,7 @@ async def delete_character(
     count = await execute(
         """
         DELETE FROM characters c USING scenarios s
-        WHERE c.id = %s AND c.scenario_id = s.id AND s.user_id = %s
+        WHERE c.id = %s AND c.scenario_id = s.id AND s.user_id = %s AND s.deleted_at IS NULL
         """,
         (character_id, user["id"]),
     )

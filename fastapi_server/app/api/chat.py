@@ -1,17 +1,19 @@
 #roleplay_backend/app/api/chat.py
 import json
+import uuid
+import secrets
 from typing import Optional, List
 import asyncio
 from datetime import datetime
 from shared.schemas.engine import DirectorEvaluation
 from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from shared.utils.game_engine import GameEngine 
-from shared.db.postgres import fetch_one, fetch_all, execute_returning
+from shared.db.postgres import fetch_one, fetch_all, execute_returning, execute, transaction
 from shared.utils.nats_client import NATSPublisher
 from fastapi_server.app.services.ws_manager import ws_manager
-from fastapi_server.app.api.users import get_current_user
+from fastapi_server.app.api.users import get_current_user, key_digest
 from shared.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -19,16 +21,26 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 nats_publisher = NATSPublisher()
 
-class ChatStartRequest(BaseModel):
-    scenario_id: int
-    ai_character_id: int
-    user_character_id: Optional[int] = None
+from fastapi_server.app.api.playthroughs import Start as ChatStartRequest
 
 class ChatMessageRequest(BaseModel):
     conversation_id: int
-    content: str
+    content: str = Field(min_length=1, max_length=16000)
+    request_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+
+@router.post('/ticket/{conversation_id}')
+async def websocket_ticket(conversation_id: int, user: dict = Depends(get_current_user)):
+    owned = await fetch_one('SELECT id FROM conversations WHERE id=%s AND user_id=%s', (conversation_id,user['id']))
+    if not owned:
+        raise HTTPException(status_code=404, detail='Conversation not found')
+    ticket = secrets.token_urlsafe(32)
+    await execute('DELETE FROM websocket_tickets WHERE expires_at<now()')
+    await execute("INSERT INTO websocket_tickets(digest,user_id,conversation_id,expires_at) VALUES (%s,%s,%s,now()+interval '1 minute')", (key_digest(ticket),user['id'],conversation_id))
+    return {'ticket': ticket}
 
 class ChatMessageResponse(BaseModel):
+    turn_id: Optional[uuid.UUID] = None
+    request_id: Optional[uuid.UUID] = None
     id: int
     conversation_id: int
     sender: str
@@ -36,101 +48,13 @@ class ChatMessageResponse(BaseModel):
     created_at: datetime
 
 
-# Real-time NATS to WebSocket Bridge Worker
-async def nats_to_websocket_bridge():
-    """Background loop for real-time un-journaled states like Director updates."""
-    await nats_publisher.connect()
-    nc = getattr(nats_publisher, "nc", None) or getattr(nats_publisher, "_nc", None)
-    if not nc:
-        return
-
-    async def message_handler(msg):
-        try:
-            subject = msg.subject
-            data = json.loads(msg.data.decode()) if msg.data else {}
-            conversation_id = int(subject.split(".")[-1])
-            
-            # Fan out ephemeral updates (like time/place mutations from the Director)
-            await ws_manager.broadcast_to_conversation(conversation_id, data)
-        except Exception as e:
-            logger.error("Failed to route background message: %s", e)
-
-    # We ONLY listen to events/updates here. Chat stream updates are handled inside the WS loop.
-    await nc.subscribe("roleplay.events.updates.>", cb=message_handler)
-    logger.info("Real-time Ephemeral Update Bridge connected.")
-
-
-@router.on_event("startup")
-async def launch_background_bridge():
-    """Asynchronously starts our event router alongside the core FastAPI application worker."""
-    asyncio.create_task(nats_to_websocket_bridge())
-
-
 @router.post("/start", response_model=dict)
 async def start_conversation(
     payload: ChatStartRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Create a new conversation for a scenario."""
-    scenario = await fetch_one(
-        "SELECT id, place, time FROM scenarios WHERE id = %s AND user_id = %s",
-        (payload.scenario_id, user["id"]),
-    )
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
-
-    ai_char = await fetch_one(
-        "SELECT id FROM characters WHERE id = %s AND scenario_id = %s AND is_ai = true",
-        (payload.ai_character_id, payload.scenario_id),
-    )
-    if not ai_char:
-        raise HTTPException(status_code=404, detail="AI character not found in scenario")
-
-    if payload.user_character_id:
-        uc = await fetch_one(
-            "SELECT id FROM characters WHERE id = %s AND scenario_id = %s AND is_ai = false",
-            (payload.user_character_id, payload.scenario_id),
-        )
-        if not uc:
-            raise HTTPException(status_code=404, detail="User character not found in scenario")
-
-    conv = await execute_returning(
-        """
-        INSERT INTO conversations (scenario_id, user_id, ai_character_id, user_character_id, current_place, "current_time", status)
-        VALUES (%s, %s, %s, %s, %s, %s, 'active')
-        RETURNING id, scenario_id, user_id, ai_character_id, user_character_id, current_place, "current_time", status, created_at, updated_at
-        """,
-        (
-            payload.scenario_id,
-            user["id"],
-            payload.ai_character_id,
-            payload.user_character_id,
-            scenario["place"] or "Unknown",
-            scenario["time"] or "Unknown",
-        ),
-    )
-
-    # Publish durable transaction message
-    payload_json = json.dumps({
-        "event": "conversation_started",
-        "conversation_id": conv["id"],
-        "user_id": user["id"],
-    })
-    await nats_publisher.publish("roleplay.events.conversation_started", payload_json.encode())
-
-    ai_char_data = await fetch_one("SELECT greeting FROM characters WHERE id = %s", (payload.ai_character_id,))
-    greeting = ai_char_data.get("greeting") if ai_char_data else None
-    if greeting:
-        await execute_returning(
-            """
-            INSERT INTO messages (conversation_id, sender, content, metadata)
-            VALUES (%s, 'ai', %s, %s)
-            RETURNING id
-            """,
-            (conv["id"], greeting, json.dumps({"type": "greeting"})),
-        )
-
-    return conv
+    from fastapi_server.app.api.playthroughs import start
+    return await start(payload,user)
 
 
 @router.post("/send", response_model=ChatMessageResponse)
@@ -138,40 +62,68 @@ async def send_message(
     payload: ChatMessageRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Fallback HTTP Message gateway routing straight into NATS processing."""
-    conv = await fetch_one(
-        "SELECT id FROM conversations WHERE id = %s AND user_id = %s AND status = 'active'",
-        (payload.conversation_id, user["id"]),
-    )
-    if not conv:
-        raise HTTPException(status_code=404, detail="Active conversation not found")
+    from shared.utils.turns import enqueue
+    async with transaction() as conn:
+        await conn.execute('SELECT pg_advisory_xact_lock(%s)', (payload.conversation_id,))
+        conv = await fetch_one("SELECT id,state_version FROM conversations WHERE id=%s AND user_id=%s AND status='active'", (payload.conversation_id,user['id']))
+        if not conv:
+            raise HTTPException(status_code=404, detail='Active conversation not found')
+        existing = await fetch_one('SELECT * FROM turns WHERE conversation_id=%s AND request_id=%s', (payload.conversation_id,payload.request_id))
+        if existing:
+            if existing['content'] != payload.content:
+                raise HTTPException(status_code=409, detail='Request ID was already used for different content')
+            msg = await fetch_one('SELECT * FROM messages WHERE id=%s',(existing['user_message_id'],))
+            return {**msg,'turn_id':existing['id'],'request_id':payload.request_id}
+        active = await fetch_one("SELECT id FROM turns WHERE conversation_id=%s AND status IN ('validating','generating','narrating')", (payload.conversation_id,))
+        if active:
+            raise HTTPException(status_code=409, detail='A response is still being generated for this conversation')
+        turn_id = uuid.uuid4()
+        msg = await execute_returning("INSERT INTO messages(conversation_id,sender,content,metadata,event_id) VALUES (%s,'user',%s,'{\"action_status\":\"pending\"}',%s) RETURNING *", (payload.conversation_id,payload.content,'user-'+str(turn_id)))
+        await execute("INSERT INTO turns(id,conversation_id,request_id,user_message_id,content,user_id,status,state_version) VALUES (%s,%s,%s,%s,%s,%s,'validating',%s)", (turn_id,payload.conversation_id,payload.request_id,msg['id'],payload.content,user['id'],conv['state_version']))
+        data = {'turn_id':str(turn_id),'event_id':str(turn_id),'conversation_id':payload.conversation_id,'user_id':user['id'],'content':payload.content,'message_id':msg['id']}
+        await enqueue(turn_id,'validate',data)
+        await nats_publisher.publish('roleplay.chat.user_message',json.dumps({'event':'user_message',**data}).encode())
+        return {**msg,'turn_id':turn_id,'request_id':payload.request_id}
 
-    msg = await execute_returning(
-        """
-        INSERT INTO messages (conversation_id, sender, content, metadata)
-        VALUES (%s, 'user', %s, %s)
-        RETURNING id, conversation_id, sender, content, created_at
-        """,
-        (payload.conversation_id, payload.content, json.dumps({"source": "api"})),
-    )
 
-    event = {
-        "event": "user_message",
-        "conversation_id": conv["id"],
-        "message_id": msg["id"],
-        "user_id": user["id"],
-        "content": payload.content
-    }
-    await nats_publisher.publish("roleplay.chat.user_message", json.dumps(event).encode())
-    return msg
+@router.get('/turn/{turn_id}')
+async def turn_status(turn_id: uuid.UUID, user: dict = Depends(get_current_user)):
+    row = await fetch_one('SELECT * FROM turns WHERE id=%s AND user_id=%s',(turn_id,user['id']))
+    if not row:
+        raise HTTPException(status_code=404,detail='Turn not found')
+    row['stages'] = await fetch_all('SELECT stage,status,attempts,last_error,completed_at FROM jobs WHERE turn_id=%s ORDER BY created_at',(turn_id,))
+    return row
+
+
+@router.post('/turn/{turn_id}/retry')
+async def retry_turn(turn_id: uuid.UUID, user: dict = Depends(get_current_user)):
+    async with transaction() as conn:
+        row = await fetch_one('SELECT * FROM turns WHERE id=%s AND user_id=%s',(turn_id,user['id']))
+        if not row:
+            raise HTTPException(status_code=404,detail='Turn not found')
+        await conn.execute('SELECT pg_advisory_xact_lock(%s)',(row['conversation_id'],))
+        current = await fetch_one('SELECT state_version FROM conversations WHERE id=%s FOR UPDATE',(row['conversation_id'],))
+        if row['status'] != 'failed' or current['state_version'] != row['state_version']:
+            raise HTTPException(status_code=409,detail='Only failed turns with an unchanged scene can resume')
+        if await fetch_one("SELECT id FROM turns WHERE conversation_id=%s AND status IN ('validating','generating','narrating')",(row['conversation_id'],)):
+            raise HTTPException(status_code=409,detail='Another turn is active')
+        job = await fetch_one("SELECT stage FROM jobs WHERE turn_id=%s AND status='dead' FOR UPDATE",(turn_id,))
+        if not job:
+            raise HTTPException(status_code=409,detail='No failed stage to retry')
+        await execute("UPDATE jobs SET status='pending',attempts=0,last_error=NULL,available_at=now(),last_notified_at=NULL WHERE turn_id=%s AND status='dead'",(turn_id,))
+        await execute('UPDATE turns SET status=%s,failure=NULL WHERE id=%s',({'validate':'validating','actor':'generating','director':'narrating'}[job['stage']],turn_id))
+    return {'turn_id':turn_id,'status':'resuming'}
 
 
 @router.get("/history/{conversation_id}", response_model=List[ChatMessageResponse])
-async def get_history(conversation_id: int, user: dict = Depends(get_current_user)):
+async def get_history(conversation_id: int, user: dict = Depends(get_current_user), before_id: Optional[int] = None, limit: int = Query(100, ge=1, le=500)):
+    conv = await fetch_one("SELECT id FROM conversations WHERE id=%s AND user_id=%s", (conversation_id, user["id"]))
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return await fetch_all(
         """SELECT id, conversation_id, sender, content, created_at
-           FROM messages WHERE conversation_id = %s ORDER BY created_at ASC""",
-        (conversation_id,),
+           FROM (SELECT * FROM messages WHERE conversation_id = %s AND NOT superseded AND (%s::int IS NULL OR id < %s) ORDER BY id DESC LIMIT %s) recent ORDER BY id ASC""",
+        (conversation_id, before_id, before_id, limit),
     )
 
 @router.websocket("/ws/{conversation_id}")
@@ -181,12 +133,12 @@ async def websocket_chat(
     last_seen_seq: Optional[int] = Query(None)  # Client supplies this parameter on reconnection
 ):
     """Decoupled real-time gateway pipeline channel with JetStream stream tracking."""
-    api_key = websocket.query_params.get("api_key")
-    if not api_key:
-        await websocket.close(code=1008, reason="Missing api_key")
+    ticket = websocket.query_params.get("ticket")
+    if not ticket:
+        await websocket.close(code=1008, reason="Missing ticket")
         return
 
-    user = await fetch_one("SELECT id FROM users WHERE api_key = %s", (api_key,))
+    user = await execute_returning('DELETE FROM websocket_tickets WHERE digest=%s AND conversation_id=%s AND expires_at>now() RETURNING user_id AS id', (key_digest(ticket),conversation_id))
     if not user:
         await websocket.close(code=1008, reason="Invalid api_key")
         return
@@ -225,6 +177,9 @@ async def websocket_chat(
     # 2. Subscribe directly to JetStream messages for this distinct conversation channel
     chat_subject = f"roleplay.chat.stream.{conversation_id}"
     nats_sub = await js.subscribe(subject=chat_subject, config=config)
+    async def forward_live(msg):
+        await websocket.send_json({'stream_sequence_id': None, 'event_body': json.loads(msg.data)})
+    live_sub = await nats_publisher.nc.subscribe(f'roleplay.live.stream.{conversation_id}', cb=forward_live)
 
     # 3. Asynchronous loop to pull from NATS JetStream and forward straight out the WebSocket
     async def stream_nats_to_client():
@@ -254,94 +209,30 @@ async def websocket_chat(
                 packet = json.loads(raw_data)
                 content = packet.get("content", "").strip()
             except Exception:
-                await websocket.send_text(json.dumps({"error": "Invalid JSON mapping structure"}))
+                await websocket.send_text(json.dumps({"event_body": {"event": "state_change", "payload": {"state": "error", "error_detail": "Invalid message"}}}))
                 continue
 
             if not content:
                 continue
 
-            # ENGINE INTERCEPTION STEP (The Director's Gate via NATS RPC)
             try:
-                # A. Retrieve current status metrics from local engine
-                current_game_state = await game_engine.get_state(conversation_id)
-
-                # B. Pack up the request context for the standalone Director Microservice
-                rpc_payload = {
-                    "conversation_id": conversation_id,
-                    "user_id": user["id"],
-                    "content": content,
-                    "game_state": current_game_state
-                }
-
-                logger.info("Requesting pre-flight action validation from Director microservice...")
-                
-                # C. Make a blocking request over NATS. The Director runs a live LLM
-                # evaluation whose latency varies (measured 2.5-4.8s, cold start higher),
-                # so the RPC deadline must leave headroom above the Director's own
-                # LLM timeout (10s) instead of racing it.
-                nc = nats_publisher.nc  # Access raw NATS connection client
-                rpc_response = await nc.request(
-                    "roleplay.director.validate_action",
-                    json.dumps(rpc_payload).encode(),
-                    timeout=15.0
-                )
-
-                raw_eval_dict = json.loads(rpc_response.data.decode())
-                raw_eval_dict.setdefault("reasoning", "No explicit reasoning provided by director.")
-                # D. Check if action breaks game logic using safe dict `.get()`
-                if not raw_eval_dict.get("is_action_allowed", True):
-                    blocked_response = {
-                        "stream_sequence_id": None,
-                        "event_body": {
-                            "event": "action_blocked",
-                            "conversation_id": conversation_id,
-                            "payload": {
-                                "reason": raw_eval_dict.get("failure_explanation", "Action rejected by the director.")
-                            }
-                        }
-                    }
-                    await websocket.send_text(json.dumps(blocked_response))
-                    continue  # Abort here — do not forward message to the Actor agent
-
-                # E. Action passed verification! Convert to Pydantic model and apply mutations locally
-                try:
-                    # Convert dict to Pydantic model before passing to the engine
-                    evaluation_model = DirectorEvaluation(**raw_eval_dict)
-                    
-                    await game_engine.apply_mutations(
-                        conversation_id, 
-                        evaluation_model,  # Pass the full Pydantic model, NOT .get("mutations", {})
-                        current_game_state
-                    )
-                except Exception as mutation_err:
-                    logger.error("Failed to apply game mutations safely: %s", mutation_err)
-            except Exception as engine_err:
-                logger.error("Director's Gate failed to validate turn safely: %s", engine_err)
-                await websocket.send_text(json.dumps({"error": "Game state evaluation timeout or failure encountered."}))
-                continue
-
-            # Proceed to Actor pipeline if validation succeeds
-            event = {
-                "event": "user_message",
-                "conversation_id": conversation_id,
-                "user_id": user["id"],
-                "content": content,
-                "timestamp": str(datetime.utcnow())
-            }
-            
-            # Fire user message into NATS for backend agents to digest
-            await nats_publisher.publish_ephemeral(
-                "roleplay.chat.user_message", 
-                json.dumps(event).encode()
-            )
+                accepted = await send_message(ChatMessageRequest(conversation_id=conversation_id, content=content, request_id=packet.get('request_id') or uuid.uuid4()), user)
+                await websocket.send_json({'event_body': {'event':'turn_accepted','turn_id':str(accepted['turn_id']),'request_id':str(accepted['request_id'])}})
+            except HTTPException as exc:
+                await websocket.send_json({"event_body": {"event": "action_blocked", "payload": {"reason": exc.detail}}})
+            except Exception:
+                logger.exception("WebSocket turn failed")
+                await websocket.send_json({"event_body": {"event": "state_change", "payload": {"state": "error", "error_detail": "Unable to process turn; please retry."}}})
 
     except WebSocketDisconnect:
         logger.info("Connection tunnel dropped cleanly for conversation %s", conversation_id)
     finally:
         # 5. Clean up open threads and references to prevent context leakage
         nats_task.cancel()
+        await asyncio.gather(nats_task, return_exceptions=True)
         try:
             await nats_sub.unsubscribe()
+            await live_sub.unsubscribe()
         except Exception:
             pass
         await ws_manager.disconnect(conversation_id, websocket)

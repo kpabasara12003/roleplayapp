@@ -1,9 +1,11 @@
+from shared.utils.observability import traced
 import os
 import asyncio
 import warnings
 from typing import List, Optional
 
 import httpx
+from shared.utils.providers import admission, retry_delay
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance,
@@ -12,6 +14,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    PayloadSchemaType,
 )
 from flashrank import Ranker, RerankRequest
 from shared.utils.logger import get_logger
@@ -30,11 +33,12 @@ EMBED_DIM = 1024  # BGE-M3 standard vector dimensions
 COLLECTIONS = {
     "conversations": "Long-term chat history memory",
     "lorebook": "Pre-defined world info",
-    "characters": "Character traits for consistency",
 }
 
 _client: Optional[AsyncQdrantClient] = None
 _ranker: Optional[Ranker] = None
+_ready_collections = set()
+_collection_lock = asyncio.Lock()
 
 
 def get_qdrant_client() -> AsyncQdrantClient:
@@ -59,6 +63,13 @@ def get_flashrank_client() -> Ranker:
 
 
 async def _ensure_collection_exists(collection_name: str):
+    async with _collection_lock:
+        if collection_name in _ready_collections:
+            return
+        await _initialize_collection(collection_name)
+        _ready_collections.add(collection_name)
+
+async def _initialize_collection(collection_name: str):
     """Safely check and automatically initialize missing collections asynchronously."""
     client = get_qdrant_client()
     try:
@@ -69,12 +80,22 @@ async def _ensure_collection_exists(collection_name: str):
                 vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
             )
             logger.info("Created missing Qdrant collection: %s", collection_name)
+        info = await client.get_collection(collection_name)
+        vectors = info.config.params.vectors
+        if getattr(vectors, 'size', None) != EMBED_DIM:
+            raise ValueError('Qdrant vector schema does not match configured embedding dimensions')
+        for field in ('conversation_id', 'scenario_id','scenario_version_id'):
+            await client.create_payload_index(collection_name, field_name=field, field_schema=PayloadSchemaType.INTEGER, wait=True)
+        if collection_name.startswith('catalog_'):
+            for field in ('genres','tones','life_stage','mode','genders'):
+                await client.create_payload_index(collection_name,field_name=field,field_schema=PayloadSchemaType.KEYWORD,wait=True)
     except Exception as e:
         logger.error("Failed to verify/create Qdrant collection %s: %s", collection_name, e)
         raise e
 
 
-async def embed_texts(texts: List[str]) -> List[List[float]]:
+@traced('provider.embedding')
+async def _embed_texts_remote(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     
@@ -90,7 +111,7 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     max_retries = 4
     backoff_factor = 2.0
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with admission(BGE_URL, sum(len(text.encode('utf-8'))+64 for text in texts)) as client:
         for attempt in range(max_retries):
             try:
                 resp = await client.post(BGE_URL, headers=headers, json=payload)
@@ -98,19 +119,43 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
                 if resp.status_code == 429:
                     sleep_time = backoff_factor ** attempt
                     logger.warning("BGE Embedding API returned 429. Backing off for %.1fs", sleep_time)
-                    await asyncio.sleep(sleep_time)
+                    await retry_delay(attempt, resp.headers.get("Retry-After"))
                     continue
                 
                 resp.raise_for_status()
                 data = resp.json()
-                return [item["embedding"] for item in data["data"]]
+                items = sorted(data['data'], key=lambda item: item.get('index', 0))
+                vectors = [item['embedding'] for item in items]
+                if len(vectors) != len(texts) or any(len(vector) != EMBED_DIM for vector in vectors):
+                    raise ValueError('Embedding count or dimension mismatch')
+                return vectors
                 
             except httpx.HTTPError as e:
                 if attempt == max_retries - 1:
                     logger.error("Persistent HTTP error executing embedding generation: %s", e)
                     raise e
-                await asyncio.sleep(backoff_factor ** attempt)
-    return []
+                await retry_delay(attempt)
+    raise RuntimeError('Embedding provider rate limit retries exhausted')
+
+async def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    import hashlib,json
+    from shared.utils.providers import valkey
+    cache=valkey()
+    version='bge-m3:1024:'+str(BGE_URL)
+    keys=['rp:embedding:'+hashlib.sha256((version+text).encode()).hexdigest() for text in texts]
+    cached=await cache.mget(keys)
+    vectors=[json.loads(item) if item else None for item in cached]
+    missing=[i for i,v in enumerate(vectors) if not isinstance(v,list) or len(v)!=EMBED_DIM]
+    if missing:
+        fresh=await _embed_texts_remote([texts[i] for i in missing])
+        async with cache.pipeline(transaction=False) as pipe:
+            for i,vector in zip(missing,fresh):
+                vectors[i]=vector
+                pipe.set(keys[i],json.dumps(vector),ex=86400)
+            await pipe.execute()
+    return vectors
 
 
 async def upsert_points(collection: str, points: List[PointStruct]):
@@ -147,6 +192,8 @@ def _build_filter(filters: Optional[dict]) -> Optional[Filter]:
         elif not isinstance(value, (dict, list)):
             conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
 
+    if not conditions and filters:
+        raise ValueError('Unsupported vector filter')
     if conditions:
         return Filter(must=conditions)
     return None
