@@ -22,7 +22,8 @@ async def main():
         while True:
             await recover_jobs()
             await asyncio.sleep(5)
-    tasks = [asyncio.create_task(publisher.relay_outbox()),asyncio.create_task(recover()),asyncio.create_task(flush_telemetry())]
+    from shared.utils.catalog_index import catalog_index_loop
+    tasks = [asyncio.create_task(publisher.relay_outbox()),asyncio.create_task(recover()),asyncio.create_task(flush_telemetry()),asyncio.create_task(catalog_index_loop())]
     try:
         await asyncio.gather(*tasks)
     finally:

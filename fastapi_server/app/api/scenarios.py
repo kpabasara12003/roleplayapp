@@ -14,10 +14,12 @@ async def create_scenario(
     payload: ScenarioCreate,
     user: dict = Depends(get_current_user),
 ):
+    from shared.models.discovery import validate_discovery
+    await validate_discovery(payload.discovery)
     row = await execute_returning(
         """
-        INSERT INTO scenarios (user_id, title, greeting, place, time, introduction, is_public,rules,initial_state)
-        VALUES (%s, %s, %s, %s, %s, %s, %s,%s::jsonb,%s::jsonb)
+        INSERT INTO scenarios (user_id, title, greeting, place, time, introduction, is_public,rules,initial_state,discovery)
+        VALUES (%s, %s, %s, %s, %s, %s, %s,%s::jsonb,%s::jsonb,%s::jsonb)
         RETURNING *
         """,
         (
@@ -30,6 +32,7 @@ async def create_scenario(
             payload.is_public,
             payload.rules.model_dump_json(),
             payload.initial_state.model_dump_json(),
+            payload.discovery.model_dump_json(),
         ),
     )
     if not row:
@@ -41,7 +44,7 @@ async def create_scenario(
 async def list_scenarios(user: dict = Depends(get_current_user)):
     rows = await fetch_all(
         """
-        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
+        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, discovery, created_at, updated_at
         FROM scenarios WHERE deleted_at IS NULL AND user_id = %s ORDER BY created_at DESC
         """,
         (user["id"],),
@@ -53,7 +56,7 @@ async def list_scenarios(user: dict = Depends(get_current_user)):
 async def get_scenario(scenario_id: int, user: dict = Depends(get_current_user)):
     row = await fetch_one(
         """
-        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
+        SELECT id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, discovery, created_at, updated_at
         FROM scenarios WHERE deleted_at IS NULL AND id = %s AND user_id = %s
         """,
         (scenario_id, user["id"]),
@@ -72,6 +75,11 @@ async def update_scenario(
     # Build dynamic SET clause safely
     fields = []
     values = []
+    if payload.discovery is not None:
+        from shared.models.discovery import validate_discovery
+        await validate_discovery(payload.discovery)
+        fields.append('discovery=%s::jsonb')
+        values.append(payload.discovery.model_dump_json())
     if payload.initial_state is not None:
         fields.append('initial_state=%s::jsonb')
         values.append(payload.initial_state.model_dump_json())
@@ -104,7 +112,7 @@ async def update_scenario(
     sql = f"""
         UPDATE scenarios SET {', '.join(fields)}
         WHERE id = %s AND user_id = %s AND deleted_at IS NULL
-        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, created_at, updated_at
+        RETURNING id, user_id, title, greeting, place, time, introduction, is_public, rules, initial_state, discovery, created_at, updated_at
     """
     row = await execute_returning(sql, tuple(values))
     if not row:

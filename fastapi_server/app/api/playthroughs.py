@@ -1,6 +1,7 @@
 """Saved playthroughs, publication, preferences and player personas."""
 import json
 import uuid
+from typing import Literal
 from fastapi import APIRouter,Depends,HTTPException,Query
 from pydantic import BaseModel,Field
 from shared.db.postgres import transaction,fetch_one,fetch_all,execute,execute_returning
@@ -71,10 +72,27 @@ async def publish(sid:int,user:dict=Depends(get_current_user)):
         return version
 
 @router.get('/catalog/scenarios')
-async def catalog(limit:int=Query(30,ge=1,le=100),before:int|None=None,user:dict=Depends(get_current_user)):
-    return await fetch_all('''SELECT s.id,v.definition->>'title' AS title,v.id AS version_id,v.definition FROM scenarios s
-      JOIN LATERAL (SELECT id,definition FROM scenario_versions WHERE scenario_id=s.id AND published ORDER BY version DESC LIMIT 1) v ON true
-      WHERE s.is_public AND s.deleted_at IS NULL AND (%s::int IS NULL OR s.id<%s) ORDER BY s.id DESC LIMIT %s''',(before,before,limit))
+async def catalog(limit:int=Query(30,ge=1,le=100),before:int|None=Query(None,ge=1),q:str=Query('',max_length=200),
+                  genre:str|None=Query(None,max_length=50),tone:str|None=Query(None,max_length=50),
+                  life_stage:str|None=Query(None,max_length=50),gender:str|None=Query(None,max_length=50),
+                  mode:Literal['freeform','structured']|None=None,user:dict=Depends(get_current_user)):
+    from fastapi_server.app.services.catalog import search_catalog
+    return await search_catalog(limit=limit,before=before,q=q,genre=genre,tone=tone,life_stage=life_stage,gender=gender,mode=mode)
+
+@router.get('/catalog/filters')
+async def catalog_filters(user:dict=Depends(get_current_user)):
+    from fastapi_server.app.services.catalog import filter_options
+    return await filter_options()
+
+@router.get('/catalog/search')
+async def semantic_catalog(q:str=Query('',max_length=200),search_type:Literal['keyword','semantic','hybrid']='hybrid',
+                          limit:int=Query(24,ge=1,le=100),cursor:str|None=Query(None,max_length=80),
+                          genre:str|None=Query(None,max_length=50),tone:str|None=Query(None,max_length=50),
+                          life_stage:str|None=Query(None,max_length=50),gender:str|None=Query(None,max_length=50),
+                          mode:Literal['freeform','structured']|None=None,user:dict=Depends(get_current_user)):
+    from fastapi_server.app.services.semantic_catalog import ranked_search
+    return await ranked_search(user['id'],q=q,search_type=search_type,limit=limit,cursor=cursor,
+        genre=genre,tone=tone,life_stage=life_stage,gender=gender,mode=mode)
 
 @router.get('/conversations')
 async def library(limit:int=Query(30,ge=1,le=100),before:int|None=None,user:dict=Depends(get_current_user)):

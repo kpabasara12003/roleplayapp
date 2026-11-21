@@ -86,6 +86,9 @@ async def _initialize_collection(collection_name: str):
             raise ValueError('Qdrant vector schema does not match configured embedding dimensions')
         for field in ('conversation_id', 'scenario_id','scenario_version_id'):
             await client.create_payload_index(collection_name, field_name=field, field_schema=PayloadSchemaType.INTEGER, wait=True)
+        if collection_name.startswith('catalog_'):
+            for field in ('genres','tones','life_stage','mode','genders'):
+                await client.create_payload_index(collection_name,field_name=field,field_schema=PayloadSchemaType.KEYWORD,wait=True)
     except Exception as e:
         logger.error("Failed to verify/create Qdrant collection %s: %s", collection_name, e)
         raise e

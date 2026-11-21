@@ -6,9 +6,11 @@ from shared.schemas.rules import ScenarioRules
 from shared.schemas.playthrough import InitialState
 from shared.models.authoring import Title,ShortText,Text4K,Text12K
 from pydantic import ConfigDict
+from shared.models.discovery import Discovery
 
 
 class ScenarioBase(BaseModel):
+    discovery: Discovery = Field(default_factory=Discovery)
     initial_state: InitialState = Field(default_factory=InitialState)
     title: str
     greeting: Optional[str] = None
@@ -30,6 +32,7 @@ class ScenarioCreate(ScenarioBase):
 
 class ScenarioUpdate(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    discovery: Discovery | None = None
     initial_state: Optional[InitialState] = None
     rules: Optional[ScenarioRules] = None
     title: Title | None = None

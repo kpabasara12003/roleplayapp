@@ -10,6 +10,8 @@ async def capture_version(sid, publish=False):
         if not scene:
             raise HTTPException(404,'Scenario not found')
         cast=await fetch_all('SELECT * FROM characters WHERE scenario_id=%s ORDER BY id',(sid,))
+        from shared.models.discovery import validate_discovery
+        await validate_discovery(scene.get('discovery',{}),cast)
         if len({c['name'].casefold() for c in cast}) != len(cast):
             raise HTTPException(422,'Character names must be unique within a scenario version')
         initial=InitialState.model_validate(scene['initial_state']).model_dump()
