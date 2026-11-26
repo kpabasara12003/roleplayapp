@@ -385,9 +385,5 @@ database.sql        Fresh-install schema and discovery configuration
 ```
 
 - [API and gameplay contracts](ROLEPLAY_API.md)
-- [Implementation notes](IMPLEMENTATION_NOTES.md)
-- [Backend upgrade notes](BACKEND_UPGRADE.md)
 - [Frontend setup and implementation](frontend/README.md)
-- [Frontend integration guide](frontend/FRONTEND_GUIDE.md)
-- [Discovery taxonomy and SQL operations](frontend/DISCOVERY_GUIDE.md)
 - [Semantic/hybrid search architecture](frontend/SEMANTIC_SEARCH.md)
