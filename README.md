@@ -1,10 +1,6 @@
 # fable. — Multi-agent roleplay application
 
-A text-only application where users create scenarios, publish them, discover stories and continue private saved playthroughs. A FastAPI backend coordinates three Python agents through PostgreSQL and NATS. The React frontend supports responsive authoring, streaming chat, saved stories and Light/Dark/System themes.
-
-**A world is optional.** A scenario can simply be a situation or conversation between characters. Place, world and era can be left blank. Images, uploads and object storage are not required.
-
-Updated **26 November 2026**. See the linked guides and the running API's `/docs` and `/openapi.json` for detailed contracts.
+A text-only application where users create scenarios, publish them, discover stories and continue private saved playthroughs. A FastAPI backend coordinates three Python agents through PostgreSQL and NATS. The React frontend supports responsive authoring, streaming chat.
 
 ## Contents
 
@@ -44,7 +40,6 @@ Users can:
 
 ## System diagram
 
-**Add your system image here manually when it is ready.** Create `docs/images/`, save the image as `system-architecture.png`, then replace the comment below with its image line. No diagram image is needed to run the app.
 
 <!-- Replace this comment after adding the file:
 ![Roleplay system architecture](docs/images/system-architecture.png)
@@ -326,63 +321,7 @@ Readiness does **not** test a real LLM response, embedding request or Qdrant que
 | Valkey UI has no keys | Verify instance/database number. Keys are created lazily and may expire. |
 | Port already used | Stop the previous stack or change its configured port; do not run both launchers. |
 
-### Optional OpenTelemetry Collector
 
-```powershell
-python -m pip install -e ".[telemetry]"
-```
-
-Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` in `.env` and restart the Python stack. Choose **one** Collector setup:
-
-- Main Compose project: `docker compose up -d otel-collector`.
-- Standalone: `docker compose -f compose.telemetry.yaml up -d`.
-
-Do not run both on the same ports. OTLP HTTP uses 4318; health is at `http://127.0.0.1:13133/`. Inspect data with the matching Compose command, for example `docker compose logs --tail 30 otel-collector`. The supplied Collector uses a debug exporter, not a persistent trace dashboard.
-
-## Verification
-
-From the activated Python environment:
-
-```powershell
-# Default regressions; service-dependent tests may be skipped.
-python -m unittest discover -s tests -v
-
-# Include integration checks against configured development services.
-$env:RUN_BACKEND_INTEGRATION='1'
-python -m unittest discover -s tests -v
-Remove-Item Env:RUN_BACKEND_INTEGRATION
-
-# Frontend checks require Node.js.
-node --test frontend/tests/transport.test.cjs frontend/tests/authoring.test.cjs
-
-# Verify the fresh-install snapshot in a temporary schema, then roll back.
-python tools/check_database_schema.py
-```
-
-Refresh the fresh-install snapshot after migrations or taxonomy configuration changes:
-
-```powershell
-python tools/export_database_schema.py
-python tools/check_database_schema.py
-```
-
-Export needs a matching PostgreSQL `pg_dump` client. It excludes user content and credentials, but includes taxonomy configuration and migration records. Automated tests are bounded evidence; exercise affected authoring/chat/search flows in a browser when changing them.
-
-## Repository and documentation
-
-```text
-fastapi_server/      HTTP/WebSocket gateway and application services
-actor_agent/        Character generation and streaming
-director_agent/     Action assessment and story events
-chronicler_agent/   History and memory/lore maintenance
-shared/             Models, DB clients, game engine, jobs, retrieval and outbox
-frontend/           React client, styles, vendor scripts and frontend tests
-migrations/         Checksummed incremental SQL migrations
-tools/              Launch, health, schema and source-sync utilities
-tests/              Backend unit/integration regressions
-config/, deploy/    NATS and telemetry configuration
-database.sql        Fresh-install schema and discovery configuration
-```
 
 - [API and gameplay contracts](ROLEPLAY_API.md)
 - [Frontend setup and implementation](frontend/README.md)
