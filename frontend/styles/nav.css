@@ -1,0 +1,174 @@
+/* ============================================================
+   NAV CSS — Sidebar navigation + app shell layout
+   ============================================================ */
+
+/* ---- App shell ---- */
+.app-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 100%;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+/* Full-width layout (for chat / secondary screens) */
+.app-layout-full {
+  grid-template-columns: 1fr;
+}
+
+/* ---- Sidebar nav ---- */
+.sidenav {
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-border);
+  overflow: hidden;
+}
+
+.sidenav-brand {
+  padding: var(--sp-5) var(--sp-4) var(--sp-4);
+  font-size: 1.0625rem;
+  font-weight: 700;
+  color: var(--color-accent);
+  letter-spacing: -0.02em;
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.sidenav-items {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-3) var(--sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+  background: none;
+  border: none;
+  font-family: var(--font-ui);
+  width: 100%;
+  text-align: left;
+}
+
+.nav-item:hover {
+  color: var(--color-text);
+  background: rgba(255,255,255,0.05);
+}
+
+.nav-item.active {
+  color: var(--color-accent);
+  background: rgba(223,185,118,0.1);
+}
+
+.nav-section-label {
+  padding: var(--sp-3) var(--sp-3) var(--sp-1);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  opacity: 0.6;
+}
+
+/* ---- Top bar ---- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+  flex-shrink: 0;
+  min-height: 52px;
+}
+
+.topbar-username {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+/* ---- Content area ---- */
+.content-area {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.content-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-8);
+}
+
+/* Responsive narrower padding on small content */
+@media (max-width: 1024px) {
+  .content-scroll {
+    padding: var(--sp-5) var(--sp-5);
+  }
+  .app-layout {
+    grid-template-columns: 190px 1fr;
+  }
+  .chat-layout {
+    grid-template-columns: 220px 1fr 240px;
+  }
+}
+
+/* ---- Back button row ---- */
+.back-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-5);
+}
+
+/* ---- Auth screen (centered) ---- */
+.auth-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-6);
+  background: var(--color-bg);
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: var(--sp-8);
+  box-shadow: var(--shadow-lg);
+  animation: slideInUp 300ms ease both;
+}
+
+.auth-brand {
+  text-align: center;
+  margin-bottom: var(--sp-6);
+}
+
+.auth-brand h1 {
+  font-size: 1.75rem;
+  color: var(--color-accent);
+}
+
+.auth-brand p {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
