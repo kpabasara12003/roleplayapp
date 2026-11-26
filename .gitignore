@@ -23,11 +23,7 @@ build/
 
 *.log
 logs/
-.sh
 .env
-tools/
+
 tests/
-.md
-.opencodeignore
-.sql
-migrations/
+tools/

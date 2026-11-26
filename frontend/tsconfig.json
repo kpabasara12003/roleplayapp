@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "types": [],
+    "jsx": "react"
+  },
+  "files": ["src/api/client.ts", "src/components/ConfirmDialog.tsx"]
+}
